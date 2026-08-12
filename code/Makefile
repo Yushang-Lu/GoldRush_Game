@@ -11,6 +11,10 @@ TARGET := player.so
 TEST_BIN := tests/test_player
 SANITIZER_BIN := tests/test_player_san
 BENCH_BIN := tests/bench
+LOG_ANALYZER := tools/log_analyzer.py
+REPLAY_COMPARE := tools/replay_compare.py
+LOGS ?= ../logs/*.log
+BASELINE_SO ?= tests/player_baseline.so
 
 all: $(TARGET)
 
@@ -41,7 +45,14 @@ sanitize: $(SANITIZER_BIN)
 bench: $(TARGET) $(BENCH_BIN)
 	./$(BENCH_BIN) 50000 3
 
+logs:
+	python3 -B $(LOG_ANALYZER) $(LOGS)
+
+replay: $(TARGET)
+	test -f $(BASELINE_SO)
+	python3 -B $(REPLAY_COMPARE) $(BASELINE_SO) $(TARGET) $(LOGS)
+
 clean:
 	rm -f $(TARGET) $(TEST_BIN) $(SANITIZER_BIN) $(BENCH_BIN)
 
-.PHONY: all test sanitize bench clean
+.PHONY: all test sanitize bench logs replay clean

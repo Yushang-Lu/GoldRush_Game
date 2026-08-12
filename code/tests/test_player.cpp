@@ -148,6 +148,35 @@ bool visitsCell(const GameInput& input, const GameOutput& output,
     return false;
 }
 
+bool unitVisitsCell(const GameInput& input, const GameOutput& output,
+                    int watched_unit, Position target) {
+    Position positions[2] = {input.my_units[0], input.my_units[1]};
+    for (int phase = 0; phase < 2; ++phase) {
+        const int unit = phase == 0 ? output.order : 1 - output.order;
+        const int begin = unit == 0 ? 0 : output.k;
+        const int end = unit == 0 ? output.k : S;
+        for (int index = begin; index < end; ++index) {
+            const int action = output.actions[index];
+            if (action == kStay) {
+                continue;
+            }
+            const Position next{positions[unit].row + kDr[action],
+                                positions[unit].col + kDc[action]};
+            if (!validPosition(next) || input.grid[next.row][next.col] == -1 ||
+                (next.row == positions[1 - unit].row &&
+                 next.col == positions[1 - unit].col)) {
+                continue;
+            }
+            positions[unit] = next;
+            if (unit == watched_unit && next.row == target.row &&
+                next.col == target.col) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 struct Rng {
     std::uint64_t state = 0xd1b54a32d192ed03ULL;
 
@@ -336,6 +365,36 @@ void testObstaclesBombsNpcsEnemiesAndSnapshots() {
     validateKnownPath(input, output);
 }
 
+void testRememberedBombAvoidanceAndRefresh() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{16, 16};
+    input.my_units_gold[0] = 1000;
+    reveal(input, input.my_units[0], 3);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][9] = -3;
+    GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+
+    input.round = 1;
+    for (int row = 0; row < GRID_SIZE; ++row) {
+        for (int col = 0; col < GRID_SIZE; ++col) {
+            input.grid[row][col] = -5;
+        }
+    }
+    output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(!unitVisitsCell(input, output, 0, Position{8, 9}),
+            "high-gold unit entered a remembered bomb hidden by fog");
+
+    input.round = 20;
+    output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+}
+
 void testRoundSequences() {
     GameInput input = baseInput(0);
     input.my_units[0] = Position{1, 1};
@@ -403,6 +462,7 @@ int main(int argc, char** argv) {
     testAllFogAndCorners();
     testAdjacentGold();
     testObstaclesBombsNpcsEnemiesAndSnapshots();
+    testRememberedBombAvoidanceAndRefresh();
     testRoundSequences();
     testFuzz(fuzz_iterations);
     std::cout << "PASS: " << g_checks << " assertions, " << fuzz_iterations

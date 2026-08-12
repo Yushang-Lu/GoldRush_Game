@@ -9,7 +9,10 @@ namespace {
 constexpr int kCells = GRID_SIZE * GRID_SIZE;
 constexpr int kStay = 4;
 constexpr int kBeamWidth = 6;
-constexpr int kMaxTargets = 12;
+constexpr int kJointWidth = 2;
+// Four highest-value targets preserve the logged immediate pickup while
+// keeping opponent-first latency low enough to retain dispatch priority.
+constexpr int kMaxTargets = 4;
 constexpr int kUnknown = 0;
 constexpr int kPassable = 1;
 constexpr int kWall = 2;
@@ -29,6 +32,7 @@ struct PersistentState {
     int gold_seen_round[kCells];
     int last_seen_round[kCells];
     int last_visit_round[kCells];
+    int bomb_seen_round[kCells];
     int region_score[REGION_COUNT + 1];
 };
 
@@ -45,6 +49,7 @@ struct TurnContext {
     std::uint8_t npc_count[kCells];
     std::uint8_t enemy_occupied[kCells];
     int position_value[kCells];
+    int estimated_gold[kCells];
     Target targets[kMaxTargets];
     int target_count;
 };
@@ -157,6 +162,7 @@ void resetState() noexcept {
         g_state.gold_seen_round[cell] = -1000;
         g_state.last_seen_round[cell] = -1000;
         g_state.last_visit_round[cell] = -1000;
+        g_state.bomb_seen_round[cell] = -1000;
     }
     for (int region = 0; region <= REGION_COUNT; ++region) {
         g_state.region_score[region] = 0;
@@ -233,6 +239,11 @@ void updateMemory(const GameInput& input) noexcept {
                 g_state.remembered_gold[cell] =
                     value > 0 ? clampInt(value, 0, 1000000) : 0;
                 g_state.gold_seen_round[cell] = input.round;
+                if (value == -3) {
+                    g_state.bomb_seen_round[cell] = input.round;
+                } else {
+                    g_state.bomb_seen_round[cell] = -1000;
+                }
             }
         }
     }
@@ -285,6 +296,10 @@ int estimatedGold(const TurnContext& context, int cell) noexcept {
     return (remembered + 3) / 4;
 }
 
+inline int cachedGold(const TurnContext& context, int cell) noexcept {
+    return context.estimated_gold[cell];
+}
+
 inline int pickupAmount(int remaining) noexcept {
     if (remaining <= 0) {
         return 0;
@@ -299,6 +314,14 @@ inline std::int64_t bombLoss(std::int64_t held) noexcept {
 
 inline std::int64_t stampedeLoss(std::int64_t held) noexcept {
     return held <= 0 ? 0 : (held + 19) / 20;
+}
+
+inline bool isRememberedBomb(const TurnContext& context, int cell) noexcept {
+    if (context.input->grid[rowOf(cell)][colOf(cell)] == -3) {
+        return true;
+    }
+    const int seen = g_state.bomb_seen_round[cell];
+    return seen >= 0 && seen / 20 == context.input->round / 20;
 }
 
 void insertTarget(TurnContext& context, const Target& target) noexcept {
@@ -349,6 +372,7 @@ void buildContext(const GameInput& input, TurnContext& context) noexcept {
 
     for (int cell = 0; cell < kCells; ++cell) {
         const int gold = estimatedGold(context, cell);
+        context.estimated_gold[cell] = gold;
         if (gold <= 0 || isWall(context, cell)) {
             continue;
         }
@@ -369,18 +393,17 @@ void buildContext(const GameInput& input, TurnContext& context) noexcept {
 int knowledgeValue(const TurnContext& context, int cell) noexcept {
     const int center_row = rowOf(cell);
     const int center_col = colOf(cell);
+    const int row_begin = center_row > 1 ? center_row - 2 : 0;
+    const int row_end = center_row + 2 < GRID_SIZE ? center_row + 2
+                                                   : GRID_SIZE - 1;
+    const int col_begin = center_col > 1 ? center_col - 2 : 0;
+    const int col_end = center_col + 2 < GRID_SIZE ? center_col + 2
+                                                   : GRID_SIZE - 1;
     int value = 0;
-    for (int dr = -2; dr <= 2; ++dr) {
-        const int row = center_row + dr;
-        if (row < 0 || row >= GRID_SIZE) {
-            continue;
-        }
-        for (int dc = -2; dc <= 2; ++dc) {
-            const int col = center_col + dc;
-            if (col < 0 || col >= GRID_SIZE) {
-                continue;
-            }
-            const int seen = g_state.last_seen_round[cellIndex(row, col)];
+    for (int row = row_begin; row <= row_end; ++row) {
+        int index = cellIndex(row, col_begin);
+        for (int col = col_begin; col <= col_end; ++col, ++index) {
+            const int seen = g_state.last_seen_round[index];
             const int age = context.input->round - seen;
             if (seen < 0) {
                 value += 4;
@@ -449,7 +472,7 @@ int nodeGoldLeft(const TurnContext& context, const SearchNode& node,
             return node.gold_left[i];
         }
     }
-    return estimatedGold(context, cell);
+    return cachedGold(context, cell);
 }
 
 void setNodeGold(SearchNode& node, int cell, int remaining) noexcept {
@@ -621,7 +644,7 @@ SearchNode expandNode(const TurnContext& context, const SearchNode& parent,
         }
     }
 
-    if (context.input->grid[next_row][next_col] == -3 &&
+    if (isRememberedBomb(context, next) &&
         !nodeBombConsumed(node, next)) {
         node.gold -= bombLoss(node.gold);
         if (node.consumed_count < S) {
@@ -694,7 +717,7 @@ int simulationGoldLeft(const TurnContext& context, const Simulation& sim,
             return sim.gold_left[i];
         }
     }
-    return estimatedGold(context, cell);
+    return cachedGold(context, cell);
 }
 
 void setSimulationGold(Simulation& sim, int cell, int remaining) noexcept {
@@ -783,7 +806,7 @@ void simulateAction(const TurnContext& context, Simulation& sim, int unit,
         }
     }
 
-    if (context.input->grid[next_row][next_col] == -3 &&
+    if (isRememberedBomb(context, next) &&
         !simulationBombConsumed(sim, next)) {
         sim.gold[unit] -= bombLoss(sim.gold[unit]);
         if (sim.consumed_count < S) {
@@ -933,8 +956,12 @@ GameOutput searchPlan(const TurnContext& context) noexcept {
     for (int split = 0; split <= S; ++split) {
         const CandidateSet& set0 = candidates[0][split];
         const CandidateSet& set1 = candidates[1][S - split];
-        for (int i = 0; i < set0.count; ++i) {
-            for (int j = 0; j < set1.count; ++j) {
+        const int joint_count0 =
+            set0.count < kJointWidth ? set0.count : kJointWidth;
+        const int joint_count1 =
+            set1.count < kJointWidth ? set1.count : kJointWidth;
+        for (int i = 0; i < joint_count0; ++i) {
+            for (int j = 0; j < joint_count1; ++j) {
                 for (int order = 0; order <= 1; ++order) {
                     const Plan candidate = evaluatePlan(
                         context, set0.items[i], set1.items[j], split, order);
