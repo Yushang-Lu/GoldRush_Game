@@ -1,580 +1,606 @@
 #include "game_api.h"
 
+#include <climits>
 #include <cstdint>
 #include <cstring>
 
+static_assert(sizeof(int) == 4, "GoldRush ABI requires 32-bit int");
+static_assert(sizeof(Position) == 8, "Position ABI mismatch");
+static_assert(sizeof(NpcInfo) == 12, "NpcInfo ABI mismatch");
+static_assert(sizeof(RegionStat) == 28, "RegionStat ABI mismatch");
+static_assert(sizeof(Snapshot) == 148, "Snapshot ABI mismatch");
+static_assert(sizeof(GameInput) == 1444, "GameInput ABI mismatch");
+static_assert(sizeof(GameOutput) == 36, "GameOutput ABI mismatch");
+
 namespace {
 
+constexpr int kSide = GRID_SIZE;
 constexpr int kCells = GRID_SIZE * GRID_SIZE;
 constexpr int kWords = (kCells + 31) / 32;
 constexpr int kStay = 4;
-constexpr int kBadScore = -1000000000;
-constexpr int kDr[4] = {-1, 1, 0, 0};
-constexpr int kDc[4] = {0, 0, -1, 1};
+constexpr int kDr[5] = {-1, 1, 0, 0, 0};
+constexpr int kDc[5] = {0, 0, -1, 1, 0};
 
-inline int cellIndex(int row, int col) noexcept {
-    return row * GRID_SIZE + col;
-}
-
-struct Tables {
-    std::int16_t neighbor[kCells][4];
-    std::uint8_t row[kCells];
-    std::uint8_t col[kCells];
-    std::uint8_t region[kCells];
+struct Offset {
+    std::int8_t dr;
+    std::int8_t dc;
+    std::int8_t delta;
+    std::uint8_t distance;
 };
 
-Tables makeTables() noexcept {
-    Tables result{};
-    for (int cell = 0; cell < kCells; ++cell) {
-        const int row = cell / GRID_SIZE;
-        const int col = cell % GRID_SIZE;
-        result.row[cell] = static_cast<std::uint8_t>(row);
-        result.col[cell] = static_cast<std::uint8_t>(col);
-        if (row >= 4 && row <= 12 && col >= 4 && col <= 12) {
-            result.region[cell] = 1;
-        } else if (row <= 3 && col <= 12) {
-            result.region[cell] = 2;
-        } else if (col <= 3 && row >= 4) {
-            result.region[cell] = 3;
-        } else if (row >= 13 && col >= 4) {
-            result.region[cell] = 4;
-        } else {
-            result.region[cell] = 5;
-        }
-        for (int action = 0; action < 4; ++action) {
-            const int next_row = row + kDr[action];
-            const int next_col = col + kDc[action];
-            result.neighbor[cell][action] =
-                next_row >= 0 && next_row < GRID_SIZE && next_col >= 0 &&
-                        next_col < GRID_SIZE
-                    ? static_cast<std::int16_t>(
-                          cellIndex(next_row, next_col))
-                    : static_cast<std::int16_t>(-1);
-        }
-    }
-    return result;
+constexpr Offset kLocal25[25] = {
+    {-2, -2, -36, 4}, {-2, -1, -35, 3}, {-2, 0, -34, 2},
+    {-2, 1, -33, 3},  {-2, 2, -32, 4},  {-1, -2, -19, 3},
+    {-1, -1, -18, 2}, {-1, 0, -17, 1},  {-1, 1, -16, 2},
+    {-1, 2, -15, 3},  {0, -2, -2, 2},   {0, -1, -1, 1},
+    {0, 0, 0, 0},     {0, 1, 1, 1},     {0, 2, 2, 2},
+    {1, -2, 15, 3},   {1, -1, 16, 2},   {1, 0, 17, 1},
+    {1, 1, 18, 2},    {1, 2, 19, 3},    {2, -2, 32, 4},
+    {2, -1, 33, 3},   {2, 0, 34, 2},    {2, 1, 35, 3},
+    {2, 2, 36, 4},
+};
+
+inline bool inside(int row, int col) noexcept {
+    return static_cast<unsigned>(row) < static_cast<unsigned>(kSide) &&
+           static_cast<unsigned>(col) < static_cast<unsigned>(kSide);
 }
 
-const Tables g_tables = makeTables();
-
-inline int rowOf(int cell) noexcept {
-    return g_tables.row[cell];
+inline bool validPosition(const Position& position) noexcept {
+    return inside(position.row, position.col);
 }
 
-inline int colOf(int cell) noexcept {
-    return g_tables.col[cell];
-}
-
-inline int adjacentCell(int cell, int action) noexcept {
-    return g_tables.neighbor[cell][action];
+constexpr int cellOf(int row, int col) noexcept {
+    return row * kSide + col;
 }
 
 inline int absInt(int value) noexcept {
     return value < 0 ? -value : value;
 }
 
-inline int manhattan(int lhs, int rhs) noexcept {
-    return absInt(rowOf(lhs) - rowOf(rhs)) +
-           absInt(colOf(lhs) - colOf(rhs));
-}
-
-inline bool validPosition(const Position& position) noexcept {
-    return static_cast<unsigned>(position.row) < GRID_SIZE &&
-           static_cast<unsigned>(position.col) < GRID_SIZE;
-}
-
-inline int clampNonnegative(int value, int maximum) noexcept {
-    if (value <= 0) {
-        return 0;
-    }
-    return value < maximum ? value : maximum;
-}
-
-inline int pickupAmount(int gold) noexcept {
-    return gold <= 0 ? 0 : static_cast<int>(
-        (static_cast<std::int64_t>(gold) * 65 + 99) / 100);
-}
-
-inline void setBit(std::uint32_t* bits, int cell) noexcept {
-    bits[cell >> 5] |= std::uint32_t{1} << (cell & 31);
-}
-
-inline void clearBit(std::uint32_t* bits, int cell) noexcept {
-    bits[cell >> 5] &= ~(std::uint32_t{1} << (cell & 31));
-}
-
-inline bool testBit(const std::uint32_t* bits, int cell) noexcept {
-    return (bits[cell >> 5] &
-            (std::uint32_t{1} << (cell & 31))) != 0;
-}
-
-struct PersistentState {
-    bool initialized;
-    int last_round;
-    int last_input_signature;
-    int last_purchase_round;
-    int vision_spend;
-    int active_bomb_cycle;
-    std::uint32_t walls[kWords];
-    std::uint32_t bombs[kWords];
-    int last_seen_round[kCells];
-    int last_visit_round[kCells];
-    int region_score[REGION_COUNT + 1];
-};
-
-PersistentState g_state{};
-
-struct TurnContext {
-    const GameInput* input;
-    const int* grid;
-    int gold_cells[kCells];
-    int gold_count;
-    std::uint32_t forbidden[kWords];
-    int visible_gold_sum;
-    int bomb_cycle;
-};
-
-struct Route {
-    std::uint8_t actions[S];
-};
-
-GameOutput fallbackOutput() noexcept {
-    GameOutput output;
-    for (int step = 0; step < S; ++step) {
-        output.actions[step] = kStay;
-    }
-    output.k = 0;
-    output.order = 0;
-    output.vp = 0;
-    return output;
-}
-
-void resetState() noexcept {
-    g_state.initialized = true;
-    g_state.last_round = -1;
-    g_state.last_input_signature = 0;
-    g_state.last_purchase_round = -1000;
-    g_state.vision_spend = 0;
-    g_state.active_bomb_cycle = 0;
-    std::memset(g_state.walls, 0, sizeof(g_state.walls));
-    std::memset(g_state.bombs, 0, sizeof(g_state.bombs));
-    std::memset(g_state.region_score, 0, sizeof(g_state.region_score));
-    for (int cell = 0; cell < kCells; ++cell) {
-        g_state.last_seen_round[cell] = -1000;
-        g_state.last_visit_round[cell] = -1000;
-    }
-}
-
-void updateSnapshot(const GameInput& input) noexcept {
-    if (input.snapshot_valid != 1) {
-        return;
-    }
-    for (int index = 0; index < REGION_COUNT; ++index) {
-        const RegionStat& stat = input.snapshot.regions[index];
-        if (stat.id < 1 || stat.id > REGION_COUNT) {
-            continue;
-        }
-        const int area = stat.id == 1 ? 81 : 52;
-        const int remaining =
-            clampNonnegative(stat.gold_remaining, 1000000);
-        const int generated =
-            clampNonnegative(stat.gold_generated, 1000000);
-        const int collected =
-            clampNonnegative(stat.gold_collected, 1000000);
-        const int occupants = clampNonnegative(stat.occupants, 100);
-        const int flow = generated > collected ? generated - collected : 0;
-        int score = (remaining * 8 + flow * 2) / area - occupants * 3;
-        if (score < -40) {
-            score = -40;
-        } else if (score > 120) {
-            score = 120;
-        }
-        g_state.region_score[stat.id] = score;
-    }
-}
-
-void prepareState(const GameInput& input) noexcept {
-    const int signature = cellIndex(input.my_units[0].row,
-                                    input.my_units[0].col) * kCells +
-                          cellIndex(input.my_units[1].row,
-                                    input.my_units[1].col);
-    const bool discontinuous = g_state.initialized &&
-        g_state.last_round >= 0 &&
-        (input.round != g_state.last_round + 1 ||
-         (input.round == g_state.last_round &&
-          signature != g_state.last_input_signature));
-    if (!g_state.initialized || input.round == 0 || discontinuous) {
-        resetState();
-    }
-    updateSnapshot(input);
-    g_state.last_input_signature = signature;
-}
-
-void updateVisibleCell(const GameInput& input, TurnContext& context,
-                       int cell) noexcept {
-    const int value = context.grid[cell];
-    if (value == -5) {
-        return;
-    }
-    g_state.last_seen_round[cell] = input.round;
-    if (value == -1) {
-        setBit(g_state.walls, cell);
-        clearBit(g_state.bombs, cell);
-        return;
-    }
-    clearBit(g_state.walls, cell);
-    if (value == -3) {
-        setBit(g_state.bombs, cell);
-        return;
-    }
-    clearBit(g_state.bombs, cell);
-    const int gold = clampNonnegative(value, 1000000);
-    if (gold > 0) {
-        if (context.gold_count < kCells) {
-            context.gold_cells[context.gold_count++] = cell;
-        }
-        context.visible_gold_sum += gold < 1000 ? gold : 1000;
-    }
-}
-
-void buildContext(const GameInput& input, TurnContext& context) noexcept {
-    context.input = &input;
-    context.grid = &input.grid[0][0];
-    context.visible_gold_sum = 0;
-    context.gold_count = 0;
-    context.bomb_cycle = input.round / 20 + 1;
-    if (context.bomb_cycle != g_state.active_bomb_cycle) {
-        std::memset(g_state.bombs, 0, sizeof(g_state.bombs));
-        g_state.active_bomb_cycle = context.bomb_cycle;
-    }
-    for (int cell = 0; cell < kCells; ++cell) {
-        if (context.grid[cell] != -5) {
-            updateVisibleCell(input, context, cell);
-        }
-    }
-    for (int word = 0; word < kWords; ++word) {
-        context.forbidden[word] =
-            g_state.walls[word] | g_state.bombs[word];
-    }
-    for (int enemy = 0; enemy < 2; ++enemy) {
-        if (validPosition(input.visible_enemies[enemy])) {
-            setBit(context.forbidden,
-                   cellIndex(input.visible_enemies[enemy].row,
-                             input.visible_enemies[enemy].col));
-        }
-    }
-
-    int npc_cells[MAX_NPCS] = {};
-    std::uint8_t npc_counts[MAX_NPCS] = {};
-    int distinct_npcs = 0;
-    int count = input.num_visible_npcs;
-    if (count < 0) {
-        count = 0;
-    } else if (count > MAX_NPCS) {
-        count = MAX_NPCS;
-    }
-    for (int index = 0; index < count; ++index) {
-        const NpcInfo& npc = input.visible_npcs[index];
-        if (npc.id == 0 || !validPosition(npc.pos)) {
-            continue;
-        }
-        const int cell = cellIndex(npc.pos.row, npc.pos.col);
-        int slot = 0;
-        while (slot < distinct_npcs && npc_cells[slot] != cell) {
-            ++slot;
-        }
-        if (slot == distinct_npcs && distinct_npcs < MAX_NPCS) {
-            npc_cells[distinct_npcs] = cell;
-            npc_counts[distinct_npcs] = 0;
-            ++distinct_npcs;
-        }
-        if (++npc_counts[slot] >= 3) {
-            setBit(context.forbidden, cell);
-        }
-    }
-    g_state.last_round = input.round;
-}
-
-inline int estimatedGold(const TurnContext& context, int cell) noexcept {
-    const int value = context.grid[cell];
+inline int clampGold(int value) noexcept {
     return value <= 0 ? 0 : (value < 1000000 ? value : 1000000);
 }
 
-int goldLeft(const TurnContext& context, int cell,
-             const int (&gold_delta)[kCells]) noexcept {
-    return gold_delta[cell] >= 0 ? gold_delta[cell] :
-                                  estimatedGold(context, cell);
+inline int remainingGold(int gold) noexcept {
+    return gold > 0 ? static_cast<int>((static_cast<std::int64_t>(gold) * 7) /
+                                       20)
+                    : 0;
 }
 
-int collectGold(const TurnContext& context, int cell,
-                int (&gold_delta)[kCells]) noexcept {
-    const int remaining = goldLeft(context, cell, gold_delta);
-    const int pickup = pickupAmount(remaining);
-    if (pickup <= 0) {
-        return 0;
-    }
-    gold_delta[cell] = remaining - pickup;
-    return pickup;
+inline int pickupGold(int gold) noexcept {
+    return gold > 0 ? gold - remainingGold(gold) : 0;
 }
 
-int explorationValue(const TurnContext& context, int cell, int held,
-                     int other) noexcept {
-    int value = 40 - absInt(rowOf(cell) - 8) * 3 -
-                absInt(colOf(cell) - 8) * 3;
-    const int seen = g_state.last_seen_round[cell];
-    const int seen_age = context.input->round - seen;
-    value += seen < 0 ? 36 : (seen_age > 12 ? 24 : seen_age * 2);
-    const int visited = g_state.last_visit_round[cell];
-    const int visit_age = context.input->round - visited;
-    value += visited < 0 ? 18 : (visit_age > 20 ? 12 : visit_age / 2);
-    value += g_state.region_score[g_tables.region[cell]];
-    int separation = manhattan(cell, other);
-    if (separation > 8) {
-        separation = 8;
-    }
-    value += separation * 3;
-    if (context.grid[cell] == -5) {
-        value += 10;
-        if (held > 600) {
-            value -= held > 1200 ? 28 : held / 45;
+struct Candidate {
+    std::uint16_t cell;
+    std::uint8_t distance;
+    std::uint8_t padding;
+};
+
+struct LocalScan {
+    Candidate candidates[25];
+    int opportunity;
+    int projected[5];
+    int count;
+};
+
+struct Target {
+    std::int16_t cell;
+    int gold;
+};
+
+struct Route {
+    std::uint8_t actions[5];
+    std::int16_t end;
+};
+
+struct GoldState {
+    std::int16_t cells[S];
+    int values[S];
+    int count;
+};
+
+struct PersistentState {
+    bool initialized;
+    int lastRound;
+    int bombCycle;
+    std::int16_t regionTarget;
+    int regionUntil;
+    std::uint32_t walls[kWords];
+    std::uint32_t bombs[kWords];
+};
+
+PersistentState gState{};
+
+GameOutput fallbackOutput() noexcept {
+    return GameOutput{{kStay, kStay, kStay, kStay, kStay, kStay}, 0, 0, 0};
+}
+
+void resetState() noexcept {
+    gState.initialized = true;
+    gState.lastRound = -1;
+    gState.bombCycle = -1;
+    gState.regionTarget = -1;
+    gState.regionUntil = -1;
+    std::memset(gState.walls, 0, sizeof(gState.walls));
+    std::memset(gState.bombs, 0, sizeof(gState.bombs));
+}
+
+void updateSnapshotTarget(const GameInput& input) noexcept {
+    if (input.snapshot_valid != 1 || input.round >= 490) return;
+    int centerScore = INT_MIN;
+    int bestOuterScore = INT_MIN;
+    int bestOuterId = -1;
+    for (int index = 0; index < REGION_COUNT; ++index) {
+        const RegionStat& stat = input.snapshot.regions[index];
+        if (stat.id < 1 || stat.id > REGION_COUNT) continue;
+        const int area = stat.id == 1 ? 81 : 52;
+        const int remaining = stat.gold_remaining <= 0
+                                  ? 0
+                                  : (stat.gold_remaining < 1000000
+                                         ? stat.gold_remaining
+                                         : 1000000);
+        const int generated = stat.gold_generated <= 0
+                                  ? 0
+                                  : (stat.gold_generated < 1000000
+                                         ? stat.gold_generated
+                                         : 1000000);
+        const int collected = stat.gold_collected <= 0
+                                  ? 0
+                                  : (stat.gold_collected < 1000000
+                                         ? stat.gold_collected
+                                         : 1000000);
+        const int occupants = stat.occupants <= 0
+                                  ? 0
+                                  : (stat.occupants < 100 ? stat.occupants
+                                                          : 100);
+        const int flow = generated > collected ? generated - collected : 0;
+        const int score = (remaining * 8 + flow * 2) / area - occupants * 3;
+        if (stat.id == 1) {
+            centerScore = score;
+        } else if (score > bestOuterScore) {
+            bestOuterScore = score;
+            bestOuterId = stat.id;
         }
     }
-    return value;
+    if (bestOuterId < 0 || centerScore == INT_MIN ||
+        bestOuterScore < centerScore + 30) {
+        return;
+    }
+    static constexpr std::int16_t regionCells[REGION_COUNT + 1] = {
+        -1, 144, 42, 136, 246, 152};
+    gState.regionTarget = regionCells[bestOuterId];
+    gState.regionUntil = input.round + 9;
 }
 
-std::int64_t evaluateJoint(const TurnContext& context, GameOutput& output,
-                           int (&ends)[2]) noexcept {
-    ends[0] = cellIndex(context.input->my_units[0].row,
-                        context.input->my_units[0].col);
-    ends[1] = cellIndex(context.input->my_units[1].row,
-                        context.input->my_units[1].col);
-    int held[2] = {
-        clampNonnegative(context.input->my_units_gold[0], 1000000000),
-        clampNonnegative(context.input->my_units_gold[1], 1000000000)};
-    int changed_cells[S] = {};
-    int gold_left[S] = {};
-    int changed_count = 0;
-    int pickup_total = 0;
+inline void setBit(std::uint32_t bits[kWords], int cell) noexcept {
+    bits[cell >> 5] |= std::uint32_t{1} << (cell & 31);
+}
+
+inline void clearBit(std::uint32_t bits[kWords], int cell) noexcept {
+    bits[cell >> 5] &= ~(std::uint32_t{1} << (cell & 31));
+}
+
+inline bool testBit(const std::uint32_t bits[kWords], int cell) noexcept {
+    return (bits[cell >> 5] &
+            (std::uint32_t{1} << (cell & 31))) != 0U;
+}
+
+void prepareBoard(const GameInput& input, const int grid[kCells],
+                  std::uint32_t forbidden[kWords]) noexcept {
+    const bool discontinuity =
+        gState.initialized && gState.lastRound >= 0 &&
+        input.round != gState.lastRound + 1;
+    if (!gState.initialized || input.round == 0 || discontinuity) {
+        resetState();
+    }
+
+    const int cycle = input.round / 20;
+    if (cycle != gState.bombCycle) {
+        std::memset(gState.bombs, 0, sizeof(gState.bombs));
+        gState.bombCycle = cycle;
+    }
+
     for (int unit = 0; unit < 2; ++unit) {
-        const int begin = unit == 0 ? 0 : output.k;
-        const int end = unit == 0 ? output.k : S;
-        for (int index = begin; index < end; ++index) {
-            const int action = output.actions[index];
-            if (action == kStay) {
+        const Position center = input.my_units[unit];
+        for (int dr = -2; dr <= 2; ++dr) {
+            const int row = center.row + dr;
+            if (static_cast<unsigned>(row) >=
+                static_cast<unsigned>(kSide)) {
                 continue;
             }
-            const int next = adjacentCell(ends[unit], action);
-            if (next < 0 || next == ends[1 - unit] ||
-                testBit(context.forbidden, next)) {
-                output.actions[index] = kStay;
-                continue;
-            }
-            ends[unit] = next;
-            int remaining = estimatedGold(context, next);
-            int changed_index = -1;
-            for (int changed = 0; changed < changed_count; ++changed) {
-                if (changed_cells[changed] == next) {
-                    remaining = gold_left[changed];
-                    changed_index = changed;
-                    break;
+            for (int dc = -2; dc <= 2; ++dc) {
+                const int col = center.col + dc;
+                if (static_cast<unsigned>(col) >=
+                    static_cast<unsigned>(kSide)) {
+                    continue;
                 }
-            }
-            const int pickup = pickupAmount(remaining);
-            if (pickup > 0) {
-                pickup_total += pickup;
-                held[unit] += pickup;
-                if (changed_index >= 0) {
-                    gold_left[changed_index] = remaining - pickup;
-                } else if (changed_count < S) {
-                    changed_cells[changed_count] = next;
-                    gold_left[changed_count] = remaining - pickup;
-                    ++changed_count;
+                const int cell = cellOf(row, col);
+                const int value = grid[cell];
+                if (value == -5) continue;
+                if (value == -1) {
+                    setBit(gState.walls, cell);
+                    clearBit(gState.bombs, cell);
+                } else if (value == -3) {
+                    clearBit(gState.walls, cell);
+                    setBit(gState.bombs, cell);
+                } else {
+                    clearBit(gState.walls, cell);
+                    clearBit(gState.bombs, cell);
                 }
             }
         }
     }
-    std::int64_t score = static_cast<std::int64_t>(pickup_total) * 1800;
-    score += explorationValue(context, ends[0], held[0], ends[1]);
-    score += explorationValue(context, ends[1], held[1], ends[0]);
-    int separation = manhattan(ends[0], ends[1]);
-    if (separation > 8) {
-        separation = 8;
+
+    for (int word = 0; word < kWords; ++word) {
+        forbidden[word] = gState.walls[word] | gState.bombs[word];
     }
-    return score + separation * 10;
+    int npcCells[MAX_NPCS]{};
+    std::uint8_t npcCounts[MAX_NPCS]{};
+    int distinctNpcs = 0;
+    int npcLimit = input.num_visible_npcs;
+    if (npcLimit < 0) npcLimit = 0;
+    if (npcLimit > MAX_NPCS) npcLimit = MAX_NPCS;
+    for (int index = 0; index < npcLimit; ++index) {
+        const NpcInfo& npc = input.visible_npcs[index];
+        if (npc.id == 0 || !validPosition(npc.pos)) continue;
+        const int cell = cellOf(npc.pos.row, npc.pos.col);
+        int slot = 0;
+        while (slot < distinctNpcs && npcCells[slot] != cell) ++slot;
+        if (slot == distinctNpcs) {
+            npcCells[slot] = cell;
+            npcCounts[slot] = 0U;
+            ++distinctNpcs;
+        }
+        if (++npcCounts[slot] >= 3U) setBit(forbidden, cell);
+    }
+    for (int index = 0; index < 2; ++index) {
+        const Position enemy = input.visible_enemies[index];
+        if (validPosition(enemy)) {
+            setBit(forbidden, cellOf(enemy.row, enemy.col));
+        }
+    }
+    gState.lastRound = input.round;
 }
 
-Route buildFastRoute(const TurnContext& context, int start, int other,
-                     int target, int initial_held) noexcept {
-    Route route{};
-    for (int step = 0; step < S; ++step) {
-        route.actions[step] = kStay;
+inline bool traversable(int cell, const std::uint32_t forbidden[kWords],
+                        bool allowFog, const int grid[kCells]) noexcept {
+    if (testBit(forbidden, cell) || grid[cell] == -1 || grid[cell] == -3) {
+        return false;
     }
-    int position = start;
-    int held = initial_held;
-    int gold_delta[kCells];
-    std::memset(gold_delta, 0xff, sizeof(gold_delta));
-    int visited[S + 1] = {start};
-    int visited_count = 1;
-    const int other_row = rowOf(other);
-    const int other_col = colOf(other);
-    for (int step = 0; step < S; ++step) {
-        int best_action = kStay;
-        int best_score = kBadScore;
-        const int target_distance = target >= 0 ?
-            manhattan(position, target) : 0;
-        int gold_cache[4];
-        for (int action = 0; action < 4; ++action) {
-            const int next = adjacentCell(position, action);
-            gold_cache[action] = next >= 0 ?
-                goldLeft(context, next, gold_delta) : 0;
-        }
-        for (int action = 0; action < 4; ++action) {
-            const int next = adjacentCell(position, action);
-            if (next < 0 || next == other ||
-                testBit(context.forbidden, next)) {
-                continue;
-            }
-            const int remaining = gold_cache[action];
-            int score = pickupAmount(remaining) * 1200;
-            int lookahead = 0;
-            if (remaining == 0 && context.gold_count >= 2 &&
-                context.gold_count <= 9 && step != 5) {
-                for (int next_action = 0; next_action < 4; ++next_action) {
-                    const int after = adjacentCell(next, next_action);
-                    if (after < 0 || after == other ||
-                        testBit(context.forbidden, after)) {
-                        continue;
-                    }
-                    const int after_gold = after == position ? 0 :
-                        estimatedGold(context, after);
-                    const int next_pickup = pickupAmount(after_gold);
-                    if (next_pickup > lookahead) {
-                        lookahead = next_pickup;
-                    }
-                }
-            }
-            score += lookahead * 520;
-            if (target >= 0) {
-                score += (target_distance - manhattan(next, target)) * 280;
-            }
-            int separation = absInt(rowOf(next) - other_row) +
-                             absInt(colOf(next) - other_col);
-            score += (separation > 8 ? 8 : separation) * 3;
-            for (int index = 0; index < visited_count; ++index) {
-                if (visited[index] == next) {
-                    score -= 45;
-                    break;
-                }
-            }
-            if (score > best_score) {
-                best_score = score;
-                best_action = action;
-            }
-        }
-        route.actions[step] = static_cast<std::uint8_t>(best_action);
-        if (best_action == kStay) {
+    return allowFog || grid[cell] != -5;
+}
+
+inline bool hasEntry(int row, int col,
+                     const std::uint32_t forbidden[kWords],
+                     const int grid[kCells]) noexcept {
+    const int cell = cellOf(row, col);
+    if (row > 0 && traversable(cell - kSide, forbidden, true, grid)) {
+        return true;
+    }
+    if (row + 1 < kSide &&
+        traversable(cell + kSide, forbidden, true, grid)) {
+        return true;
+    }
+    if (col > 0 && traversable(cell - 1, forbidden, true, grid)) return true;
+    if (col + 1 < kSide && traversable(cell + 1, forbidden, true, grid)) {
+        return true;
+    }
+    return false;
+}
+
+void scanLocal(const GameInput& input, int unit,
+               const std::uint32_t forbidden[kWords],
+               LocalScan& scan) noexcept {
+    scan.opportunity = 0;
+    scan.count = 0;
+    for (int index = 0; index < 5; ++index) scan.projected[index] = 0;
+    const Position start = input.my_units[unit];
+    const int startCell = cellOf(start.row, start.col);
+    const int* const grid = &input.grid[0][0];
+    for (const Offset& offset : kLocal25) {
+        const int row = start.row + offset.dr;
+        const int col = start.col + offset.dc;
+        if (!inside(row, col)) continue;
+        const int cell = startCell + offset.delta;
+        const int value = clampGold(grid[cell]);
+        if (value <= 0 || !traversable(cell, forbidden, true, grid)) continue;
+        if (offset.distance != 0 &&
+            !hasEntry(row, col, forbidden, grid)) {
             continue;
         }
-        position = adjacentCell(position, best_action);
-        visited[visited_count++] = position;
-        held += collectGold(context, position, gold_delta);
+
+        const int remain1 = remainingGold(value);
+        const int take1 = value - remain1;
+        const int remain2 = remainingGold(remain1);
+        const int prefix2 = take1 + remain1 - remain2;
+        const int prefix3 = prefix2 + remain2 - remainingGold(remain2);
+        scan.opportunity += take1;
+
+        const int distance = offset.distance;
+        switch (distance) {
+        case 0:
+        case 2:
+            if (take1 > scan.projected[1]) scan.projected[1] = take1;
+            if (take1 > scan.projected[2]) scan.projected[2] = take1;
+            if (prefix2 > scan.projected[3]) scan.projected[3] = prefix2;
+            if (prefix2 > scan.projected[4]) scan.projected[4] = prefix2;
+            break;
+        case 1:
+            if (take1 > scan.projected[0]) scan.projected[0] = take1;
+            if (take1 > scan.projected[1]) scan.projected[1] = take1;
+            if (prefix2 > scan.projected[2]) scan.projected[2] = prefix2;
+            if (prefix2 > scan.projected[3]) scan.projected[3] = prefix2;
+            if (prefix3 > scan.projected[4]) scan.projected[4] = prefix3;
+            break;
+        case 3:
+            if (take1 > scan.projected[2]) scan.projected[2] = take1;
+            if (take1 > scan.projected[3]) scan.projected[3] = take1;
+            if (prefix2 > scan.projected[4]) scan.projected[4] = prefix2;
+            break;
+        default:
+            if (take1 > scan.projected[3]) scan.projected[3] = take1;
+            if (take1 > scan.projected[4]) scan.projected[4] = take1;
+            break;
+        }
+        scan.candidates[scan.count++] = Candidate{
+            static_cast<std::uint16_t>(cell), offset.distance, 0U};
     }
-    return route;
 }
 
-GameOutput chooseFastPlan(const TurnContext& context) noexcept {
-    const int starts[2] = {
-        cellIndex(context.input->my_units[0].row,
-                  context.input->my_units[0].col),
-        cellIndex(context.input->my_units[1].row,
-                  context.input->my_units[1].col)};
-    int targets[2] = {-1, -1};
-    for (int unit = 0; unit < 2; ++unit) {
-        int best_priority = kBadScore;
-        for (int index = 0; index < context.gold_count; ++index) {
-            const int cell = context.gold_cells[index];
-            if (testBit(context.forbidden, cell)) {
-                continue;
+Target selectTarget(const Position start, const LocalScan& scan, int budget,
+                    const int grid[kCells], int forbidden,
+                    const GoldState& goldState) noexcept {
+    Target best{static_cast<std::int16_t>(cellOf(start.row, start.col)), 0};
+    Target approach = best;
+    int bestProjected = 0;
+    int bestFirst = 0;
+    int bestDistance = INT_MAX;
+    int approachFirst = 0;
+    for (int index = 0; index < scan.count; ++index) {
+        const Candidate& candidate = scan.candidates[index];
+        const int cell = candidate.cell;
+        if (cell == forbidden) continue;
+        int value = clampGold(grid[cell]);
+        for (int changed = 0; changed < goldState.count; ++changed) {
+            if (goldState.cells[changed] == cell) {
+                value = goldState.values[changed];
+                break;
             }
-            const int gold = estimatedGold(context, cell);
-            if (gold <= 0) {
-                continue;
+        }
+        if (value <= 0) continue;
+        const int distance = candidate.distance;
+        const int first = pickupGold(value);
+        if (distance == budget + 1) {
+            if (first > approachFirst) {
+                approach = Target{static_cast<std::int16_t>(cell), value};
+                approachFirst = first;
             }
-            int priority = pickupAmount(gold) * 300;
-            priority -= manhattan(starts[unit], cell) * 100;
-            if (priority > best_priority) {
-                best_priority = priority;
-                targets[unit] = cell;
-            }
+            continue;
+        }
+        if (distance > budget || (distance == 0 && budget < 2)) continue;
+        const int entries = distance == 0 ? budget / 2
+                                          : 1 + (budget - distance) / 2;
+        int remaining = value;
+        int projected = 0;
+        for (int entry = 0; entry < entries && entry < 3; ++entry) {
+            const int take = pickupGold(remaining);
+            projected += take;
+            remaining -= take;
+        }
+        if (projected > bestProjected ||
+            (projected == bestProjected &&
+             (first > bestFirst ||
+              (first == bestFirst && distance < bestDistance)))) {
+            best = Target{static_cast<std::int16_t>(cell), value};
+            bestProjected = projected;
+            bestFirst = first;
+            bestDistance = distance;
         }
     }
-    const Route routes[2] = {
-        buildFastRoute(context, starts[0], starts[1], targets[0],
-                       clampNonnegative(context.input->my_units_gold[0],
-                                        1000000000)),
-        buildFastRoute(context, starts[1], starts[0], targets[1],
-                       clampNonnegative(context.input->my_units_gold[1],
-                                        1000000000))};
-    GameOutput best = fallbackOutput();
-    std::int64_t best_score = kBadScore;
-    int best_ends[2] = {starts[0], starts[1]};
-    constexpr int splits[3] = {0, 3, 6};
-    for (int split_index = 0; split_index < 3; ++split_index) {
-        const int split = splits[split_index];
-        GameOutput candidate = fallbackOutput();
-        candidate.k = split;
-        for (int step = 0; step < split; ++step) {
-            candidate.actions[step] = routes[0].actions[step];
-        }
-        for (int step = 0; step < S - split; ++step) {
-            candidate.actions[split + step] = routes[1].actions[step];
-        }
-        int ends[2];
-        const std::int64_t score = evaluateJoint(context, candidate, ends) -
-                                   absInt(split - 3) * 3;
-        if (score > best_score) {
-            best_score = score;
-            best = candidate;
-            best_ends[0] = ends[0];
-            best_ends[1] = ends[1];
+    return bestProjected > 0 ? best : approach;
+}
+
+Target macroTarget(const GameInput& input, int unit) noexcept {
+    static constexpr std::int16_t patrol[8][2] = {
+        {109, 179}, {111, 177}, {129, 159}, {163, 125},
+        {179, 109}, {177, 111}, {159, 129}, {125, 163},
+    };
+    const Position start = input.my_units[unit];
+    if (unit == 1 && input.round <= gState.regionUntil &&
+        gState.regionTarget >= 0) {
+        return Target{gState.regionTarget, 0};
+    }
+    if (start.row < 4 || start.row > 12 || start.col < 4 || start.col > 12) {
+        return Target{static_cast<std::int16_t>(
+                          unit == 0 ? cellOf(7, 8) : cellOf(9, 8)),
+                      0};
+    }
+    return Target{patrol[(input.round >> 2) & 7][unit], 0};
+}
+
+int chooseAllocation(const LocalScan& scan0, const LocalScan& scan1) noexcept {
+    int best = 3;
+    int bestValue = -1;
+    int proportional = 3;
+    if (scan0.opportunity > scan1.opportunity) {
+        proportional = scan0.opportunity > 2 * scan1.opportunity ? 5 : 4;
+    } else if (scan1.opportunity > scan0.opportunity) {
+        proportional = scan1.opportunity > 2 * scan0.opportunity ? 1 : 2;
+    }
+    int bestTie = INT_MAX;
+    for (int allocation = 1; allocation <= 5; ++allocation) {
+        const int value = scan0.projected[allocation - 1] +
+                          scan1.projected[5 - allocation];
+        const int tie = absInt(allocation - proportional);
+        if (value > bestValue || (value == bestValue && tie < bestTie)) {
+            best = allocation;
+            bestValue = value;
+            bestTie = tie;
         }
     }
-    g_state.last_visit_round[best_ends[0]] = context.input->round;
-    g_state.last_visit_round[best_ends[1]] = context.input->round;
     return best;
 }
 
-int chooseVision(const TurnContext& context) noexcept {
-    const GameInput& input = *context.input;
-    if (input.round < 2 || input.round >= 490 ||
-        input.round - g_state.last_purchase_round < 8 ||
-        context.visible_gold_sum >= 12) {
-        return 0;
+inline int distanceTo(int cell, int target) noexcept {
+    const int row = cell / kSide;
+    const int col = cell - row * kSide;
+    const int targetRow = target / kSide;
+    const int targetCol = target - targetRow * kSide;
+    return absInt(row - targetRow) + absInt(col - targetCol);
+}
+
+int chooseStep(int current, int target, int macro, int blocked,
+               bool allowFog, int previous,
+               const std::uint32_t forbidden[kWords], const int grid[kCells],
+               const GoldState& goldState) noexcept {
+    const int row = current / kSide;
+    const int col = current - row * kSide;
+    int bestAction = kStay;
+    std::int64_t bestScore = LLONG_MIN;
+    for (int action = 0; action < 4; ++action) {
+        const int nextRow = row + kDr[action];
+        const int nextCol = col + kDc[action];
+        if (!inside(nextRow, nextCol)) continue;
+        const int next = cellOf(nextRow, nextCol);
+        if (next == blocked ||
+            !traversable(next, forbidden, allowFog, grid)) {
+            continue;
+        }
+        const int destination = target >= 0 ? target : macro;
+        std::int64_t score =
+            -static_cast<std::int64_t>(distanceTo(next, destination)) * 256;
+        int value = clampGold(grid[next]);
+        for (int changed = 0; changed < goldState.count; ++changed) {
+            if (goldState.cells[changed] == next) {
+                value = goldState.values[changed];
+                break;
+            }
+        }
+        if (value > 0) {
+            score += static_cast<std::int64_t>(pickupGold(value)) * 4096;
+        }
+        if (grid[next] == -5) score -= 16;
+        if (previous >= 0 && (previous ^ 1) == action) score -= 8;
+        if (score > bestScore) {
+            bestScore = score;
+            bestAction = action;
+        }
     }
-    const int wealth = clampNonnegative(input.my_units_gold[0], 1000000000) +
-                       clampNonnegative(input.my_units_gold[1], 1000000000);
-    if (wealth - g_state.vision_spend < 10) {
-        return 0;
+    return bestAction;
+}
+
+Route makeRoute(const GameInput& input, int unit, Target target, Target macro,
+                int blocked, int actionCount,
+                const std::uint32_t forbidden[kWords],
+                GoldState& goldState) noexcept {
+    Route route{{kStay, kStay, kStay, kStay, kStay},
+                static_cast<std::int16_t>(cellOf(input.my_units[unit].row,
+                                                 input.my_units[unit].col))};
+    int current = route.end;
+    int previous = -1;
+    const bool allowFog = input.my_units_gold[unit] < 200;
+    const int* const grid = &input.grid[0][0];
+    for (int step = 0; step < actionCount; ++step) {
+        int destination = target.gold > 0 ? target.cell : macro.cell;
+        if (target.gold > 0 && current == target.cell) {
+            destination = macro.cell;
+        }
+        const int action = chooseStep(current, destination, macro.cell,
+                                      blocked, allowFog, previous, forbidden,
+                                      grid, goldState);
+        route.actions[step] = static_cast<std::uint8_t>(action);
+        if (action == kStay) continue;
+        const int row = current / kSide;
+        const int col = current - row * kSide;
+        current = cellOf(row + kDr[action], col + kDc[action]);
+        int value = clampGold(grid[current]);
+        int changedIndex = -1;
+        for (int changed = 0; changed < goldState.count; ++changed) {
+            if (goldState.cells[changed] == current) {
+                value = goldState.values[changed];
+                changedIndex = changed;
+                break;
+            }
+        }
+        if (value > 0) {
+            const int take = pickupGold(value);
+            if (changedIndex < 0) {
+                changedIndex = goldState.count++;
+                goldState.cells[changedIndex] =
+                    static_cast<std::int16_t>(current);
+            }
+            goldState.values[changedIndex] = value - take;
+        }
+        previous = action;
     }
-    const bool behind = input.gold_opp > wealth + 25;
-    int stale = 0;
-    for (int unit = 0; unit < 2; ++unit) {
-        const int cell = cellIndex(input.my_units[unit].row,
-                                   input.my_units[unit].col);
-        const int seen = g_state.last_seen_round[cell];
-        stale += seen < 0 ? 16 : input.round - seen;
+    route.end = static_cast<std::int16_t>(current);
+    return route;
+}
+
+GameOutput decide(const GameInput& input) noexcept {
+    int ground[kCells];
+    std::memcpy(ground, input.grid, sizeof(ground));
+    std::uint32_t forbidden[kWords];
+    prepareBoard(input, ground, forbidden);
+    updateSnapshotTarget(input);
+    const int* const grid = ground;
+
+    LocalScan scans[2]{};
+    scanLocal(input, 0, forbidden, scans[0]);
+    scanLocal(input, 1, forbidden, scans[1]);
+    const int allocation = chooseAllocation(scans[0], scans[1]);
+    const int budgets[2] = {allocation, S - allocation};
+    const int firstUnit = scans[1].projected[budgets[1] - 1] >
+                                  scans[0].projected[budgets[0] - 1]
+                              ? 1
+                              : 0;
+    const int secondUnit = 1 - firstUnit;
+    GoldState goldState{{}, {}, 0};
+    Target targets[2] = {selectTarget(input.my_units[0], scans[0],
+                                      budgets[0], grid, -1, goldState),
+                         selectTarget(input.my_units[1], scans[1],
+                                      budgets[1], grid, -1, goldState)};
+    const Target macros[2] = {macroTarget(input, 0), macroTarget(input, 1)};
+
+    Route routes[2]{};
+    const int secondStart = cellOf(input.my_units[secondUnit].row,
+                                   input.my_units[secondUnit].col);
+    routes[firstUnit] = makeRoute(input, firstUnit, targets[firstUnit],
+                                  macros[firstUnit], secondStart,
+                                  budgets[firstUnit], forbidden, goldState);
+    int secondTargetGold = clampGold(grid[targets[secondUnit].cell]);
+    for (int changed = 0; changed < goldState.count; ++changed) {
+        if (goldState.cells[changed] == targets[secondUnit].cell) {
+            secondTargetGold = goldState.values[changed];
+            break;
+        }
     }
-    if (!behind && stale < 8 && context.visible_gold_sum > 0) {
-        return 0;
+    if (targets[secondUnit].cell == routes[firstUnit].end ||
+        secondTargetGold <= 0) {
+        targets[secondUnit] = selectTarget(
+            input.my_units[secondUnit], scans[secondUnit],
+            budgets[secondUnit], grid, routes[firstUnit].end, goldState);
     }
-    g_state.last_purchase_round = input.round;
-    g_state.vision_spend += 2;
-    return 1;
+    routes[secondUnit] = makeRoute(
+        input, secondUnit, targets[secondUnit], macros[secondUnit],
+        routes[firstUnit].end, budgets[secondUnit], forbidden, goldState);
+
+    GameOutput output{{kStay, kStay, kStay, kStay, kStay, kStay},
+                      allocation, firstUnit, 0};
+    for (int step = 0; step < budgets[0]; ++step) {
+        output.actions[step] = routes[0].actions[step];
+    }
+    for (int step = 0; step < budgets[1]; ++step) {
+        output.actions[allocation + step] = routes[1].actions[step];
+    }
+    return output;
 }
 
 }  // namespace
 
-extern "C" GameOutput moveDecision(const GameInput* input) {
+extern "C" __attribute__((visibility("default")))
+GameOutput moveDecision(const GameInput* input) {
     if (input == nullptr || input->round < 0 || input->round > 1000000 ||
         !validPosition(input->my_units[0]) ||
         !validPosition(input->my_units[1]) ||
@@ -582,10 +608,5 @@ extern "C" GameOutput moveDecision(const GameInput* input) {
          input->my_units[0].col == input->my_units[1].col)) {
         return fallbackOutput();
     }
-    prepareState(*input);
-    TurnContext context{};
-    buildContext(*input, context);
-    GameOutput output = chooseFastPlan(context);
-    output.vp = chooseVision(context);
-    return output;
+    return decide(*input);
 }

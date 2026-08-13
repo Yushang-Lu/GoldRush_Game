@@ -177,6 +177,55 @@ bool unitVisitsCell(const GameInput& input, const GameOutput& output,
     return false;
 }
 
+int actionCountForUnit(const GameOutput& output, int unit) {
+    return unit == 0 ? output.k : S - output.k;
+}
+
+int pickupOnKnownPath(const GameInput& input, const GameOutput& output) {
+    Position positions[2] = {input.my_units[0], input.my_units[1]};
+    int cells[S]{};
+    int remaining[S]{};
+    int changed_count = 0;
+    int pickup = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        const int unit = phase == 0 ? output.order : 1 - output.order;
+        const int begin = unit == 0 ? 0 : output.k;
+        const int end = unit == 0 ? output.k : S;
+        for (int index = begin; index < end; ++index) {
+            const int action = output.actions[index];
+            if (action == kStay) continue;
+            const Position next{positions[unit].row + kDr[action],
+                                positions[unit].col + kDc[action]};
+            if (!validPosition(next) || input.grid[next.row][next.col] == -1 ||
+                input.grid[next.row][next.col] == -3 ||
+                (next.row == positions[1 - unit].row &&
+                 next.col == positions[1 - unit].col)) {
+                continue;
+            }
+            positions[unit] = next;
+            const int cell = next.row * GRID_SIZE + next.col;
+            int value = input.grid[next.row][next.col];
+            int slot = -1;
+            for (int changed = 0; changed < changed_count; ++changed) {
+                if (cells[changed] == cell) {
+                    value = remaining[changed];
+                    slot = changed;
+                    break;
+                }
+            }
+            if (value <= 0) continue;
+            const int take = (value * 65 + 99) / 100;
+            pickup += take;
+            if (slot < 0) {
+                slot = changed_count++;
+                cells[slot] = cell;
+            }
+            remaining[slot] = value - take;
+        }
+    }
+    return pickup;
+}
+
 struct Rng {
     std::uint64_t state = 0xd1b54a32d192ed03ULL;
 
@@ -324,6 +373,99 @@ void testAdjacentGold() {
     validateKnownPath(input, output);
     require(visitsCell(input, output, Position{8, 9}),
             "strategy ignored an uncontested adjacent high-value coin");
+}
+
+void testDynamicAllocationAndRepeatedPickup() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{15, 15};
+    reveal(input, input.my_units[0], 2);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][9] = 100;
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(actionCountForUnit(output, 0) >= 4,
+            "strategy did not shift budget toward the profitable unit");
+    require(pickupOnKnownPath(input, output) >= 87,
+            "strategy did not re-enter a rich tile for repeated pickup");
+}
+
+void testProfitableUnitMovesFirst() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{8, 12};
+    reveal(input, input.my_units[0], 2);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][11] = 120;
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(output.order == 1,
+            "strategy did not execute the more profitable unit first");
+    require(unitVisitsCell(input, output, 1, Position{8, 11}),
+            "profitable second unit missed its adjacent target");
+}
+
+void testCrowdedGoldAvoidance() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{16, 16};
+    reveal(input, input.my_units[0], 2);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][9] = 100;
+    input.num_visible_npcs = 3;
+    for (int npc = 0; npc < 3; ++npc) {
+        input.visible_npcs[npc].id = npc + 1;
+        input.visible_npcs[npc].pos = Position{8, 9};
+    }
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(!unitVisitsCell(input, output, 0, Position{8, 9}),
+            "strategy entered a tile occupied by three visible NPCs");
+}
+
+void testSnapshotOuterRedirectAndExpiry() {
+    GameInput input = baseInput(5);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{8, 8 + 4};
+    input.snapshot_valid = 1;
+    for (int region = 0; region < REGION_COUNT; ++region) {
+        RegionStat& stat = input.snapshot.regions[region];
+        stat.id = region + 1;
+        stat.gold_generated = 0;
+        stat.gold_collected = 0;
+        stat.gold_remaining = 0;
+        stat.occupants = 0;
+    }
+    input.snapshot.regions[2].gold_remaining = 1000;
+    GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(unitVisitsCell(input, output, 1, Position{8, 11}),
+            "outer-rich snapshot did not redirect the scouting unit");
+
+    input.round = 20;
+    input.snapshot_valid = 0;
+    output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+}
+
+void testHighGoldDoesNotEnterFog() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{16, 16};
+    input.my_units_gold[0] = 1000;
+    input.grid[8][8] = 0;
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    for (int index = 0; index < output.k; ++index) {
+        require(output.actions[index] == kStay,
+                "high-gold unit entered unknown fog without a target");
+    }
 }
 
 void testObstaclesBombsNpcsEnemiesAndSnapshots() {
@@ -475,6 +617,11 @@ int main(int argc, char** argv) {
     testFallback();
     testAllFogAndCorners();
     testAdjacentGold();
+    testDynamicAllocationAndRepeatedPickup();
+    testProfitableUnitMovesFirst();
+    testCrowdedGoldAvoidance();
+    testSnapshotOuterRedirectAndExpiry();
+    testHighGoldDoesNotEnterFog();
     testObstaclesBombsNpcsEnemiesAndSnapshots();
     testRememberedBombAvoidanceAndRefresh();
     testLargeGoldDoesNotOverflow();
