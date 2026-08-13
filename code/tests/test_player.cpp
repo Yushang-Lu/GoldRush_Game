@@ -395,6 +395,20 @@ void testRememberedBombAvoidanceAndRefresh() {
     validateKnownPath(input, output);
 }
 
+void testLargeGoldDoesNotOverflow() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{16, 16};
+    reveal(input, input.my_units[0], 3);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][9] = 1000000;
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(visitsCell(input, output, Position{8, 9}),
+            "strategy overflowed while evaluating maximum clamped gold");
+}
+
 void testRoundSequences() {
     GameInput input = baseInput(0);
     input.my_units[0] = Position{1, 1};
@@ -463,6 +477,7 @@ int main(int argc, char** argv) {
     testAdjacentGold();
     testObstaclesBombsNpcsEnemiesAndSnapshots();
     testRememberedBombAvoidanceAndRefresh();
+    testLargeGoldDoesNotOverflow();
     testRoundSequences();
     testFuzz(fuzz_iterations);
     std::cout << "PASS: " << g_checks << " assertions, " << fuzz_iterations

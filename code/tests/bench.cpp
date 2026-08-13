@@ -147,6 +147,70 @@ void printRun(int run, std::vector<std::int64_t>& samples,
               << " checksum=" << checksum << '\n';
 }
 
+DecisionFunction loadDecision(const char* path, void*& library) {
+    library = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+        std::cerr << "dlopen failed for " << path << ": " << dlerror()
+                  << '\n';
+        return nullptr;
+    }
+    dlerror();
+    void* symbol = dlsym(library, "moveDecision");
+    const char* error = dlerror();
+    if (error != nullptr) {
+        std::cerr << "dlsym failed for " << path << ": " << error << '\n';
+        dlclose(library);
+        library = nullptr;
+        return nullptr;
+    }
+    DecisionFunction result = nullptr;
+    static_assert(sizeof(result) == sizeof(symbol));
+    std::memcpy(&result, &symbol, sizeof(result));
+    return result;
+}
+
+double measureP90(DecisionFunction decide,
+                  const std::array<GameInput, kTurns>& turns,
+                  std::size_t samples, std::uint64_t& checksum,
+                  std::size_t offset) {
+    constexpr int kWarmupGames = 4;
+    for (int game = 0; game < kWarmupGames; ++game) {
+        for (int round = 0; round < kTurns; ++round) {
+            const GameOutput output = decide(&turns[round]);
+            checksum = checksum * 1315423911ULL +
+                       static_cast<std::uint64_t>(
+                           output.actions[(round + game) % S] + 1 +
+                           output.k * 7 + output.vp * 31);
+        }
+    }
+    std::vector<std::int64_t> values(samples);
+    for (std::size_t sample = 0; sample < samples; ++sample) {
+        const std::size_t index = sample + offset;
+        const GameInput& input = turns[index % kTurns];
+        const auto begin = Clock::now();
+        const GameOutput output = decide(&input);
+        const auto end = Clock::now();
+        values[sample] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             end - begin).count();
+        checksum = checksum * 1315423911ULL +
+                   static_cast<std::uint64_t>(output.actions[index % S] + 1 +
+                                              output.k * 7 + output.vp * 31);
+    }
+    std::sort(values.begin(), values.end());
+    return percentile(values, 0.90);
+}
+
+double measureComparison(DecisionFunction first, DecisionFunction second,
+                         const std::array<GameInput, kTurns>& turns,
+                         std::size_t samples, std::uint64_t& checksum,
+                         std::size_t offset, double& second_p90) {
+    const double first_p90 = measureP90(
+        first, turns, samples, checksum, offset);
+    second_p90 = measureP90(
+        second, turns, samples, checksum, offset + kTurns / 2);
+    return first_p90;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -163,23 +227,17 @@ int main(int argc, char** argv) {
         std::cerr << "samples and runs must be positive\n";
         return 2;
     }
+    if (argc > 5) {
+        std::cerr << "usage: " << argv[0]
+                  << " [SAMPLES [RUNS [BASELINE_SO [MAX_RATIO]]]]\n";
+        return 2;
+    }
 
-    void* library = dlopen("./player.so", RTLD_NOW | RTLD_LOCAL);
-    if (library == nullptr) {
-        std::cerr << "dlopen failed: " << dlerror() << '\n';
+    void* library = nullptr;
+    DecisionFunction decide = loadDecision("./player.so", library);
+    if (decide == nullptr) {
         return 1;
     }
-    dlerror();
-    void* symbol = dlsym(library, "moveDecision");
-    const char* symbol_error = dlerror();
-    if (symbol_error != nullptr) {
-        std::cerr << "dlsym failed: " << symbol_error << '\n';
-        dlclose(library);
-        return 1;
-    }
-    DecisionFunction decide = nullptr;
-    static_assert(sizeof(decide) == sizeof(symbol));
-    std::memcpy(&decide, &symbol, sizeof(decide));
 
     std::array<GameInput, kTurns> turns{};
     for (int round = 0; round < kTurns; ++round) {
@@ -223,6 +281,38 @@ int main(int argc, char** argv) {
         printRun(run, samples, checksum);
     }
 
+    if (argc >= 4) {
+        void* baseline_library = nullptr;
+        DecisionFunction baseline = loadDecision(argv[3], baseline_library);
+        if (baseline == nullptr) {
+            dlclose(library);
+            return 1;
+        }
+        const double required_ratio = argc >= 5 ? std::strtod(argv[4], nullptr)
+                                                : 0.05;
+        double candidate_p90_first = 0.0;
+        const double baseline_p90_first = measureComparison(
+            baseline, decide, turns, samples_per_run, checksum, 0,
+            candidate_p90_first);
+        double baseline_p90_second = 0.0;
+        const double candidate_p90_second = measureComparison(
+            decide, baseline, turns, samples_per_run, checksum, kTurns / 4,
+            baseline_p90_second);
+        const double baseline_p90 =
+            (baseline_p90_first + baseline_p90_second) / 2.0;
+        const double candidate_p90 =
+            (candidate_p90_first + candidate_p90_second) / 2.0;
+        const double ratio = candidate_p90 / baseline_p90;
+        std::cout << "comparison baseline_p90_us=" << baseline_p90
+                  << " candidate_p90_us=" << candidate_p90
+                  << " ratio=" << ratio
+                  << " required_ratio=" << required_ratio << '\n';
+        dlclose(baseline_library);
+        if (ratio > required_ratio) {
+            dlclose(library);
+            return 4;
+        }
+    }
     dlclose(library);
     return checksum == 0 ? 3 : 0;
 }

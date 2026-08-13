@@ -264,6 +264,7 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
         f"  immediate_value: worse={immediate[0]} equal={immediate[1]} "
         f"better={immediate[2]}"
     )
+    return totals, immediate
 
 
 def main(argv: list[str]) -> int:
@@ -275,8 +276,31 @@ def main(argv: list[str]) -> int:
     try:
         baseline = Strategy(args.baseline)
         candidate = Strategy(args.candidate)
+        aggregate = [[0] * 6, [0] * 6]
+        immediate = [0, 0, 0]
         for path in args.logs:
-            compare(read_log(path), baseline, candidate)
+            totals, match_immediate = compare(
+                read_log(path), baseline, candidate
+            )
+            for strategy in range(2):
+                for metric in range(6):
+                    aggregate[strategy][metric] += totals[strategy][metric]
+            for index in range(3):
+                immediate[index] += match_immediate[index]
+        if len(args.logs) > 1:
+            print("aggregate:")
+            for label, values in zip(("baseline", "candidate"), aggregate):
+                print(
+                    f"  {label}: visible_pickup={values[0]} "
+                    f"known_loss={values[1]} "
+                    f"remembered_bomb_risk={values[2]} "
+                    f"remembered_bomb_entries={values[3]} "
+                    f"fog_moves={values[4]} blocked={values[5]}"
+                )
+            print(
+                f"  immediate_value: worse={immediate[0]} "
+                f"equal={immediate[1]} better={immediate[2]}"
+            )
     except (OSError, ValueError) as error:
         parser.error(str(error))
     return 0

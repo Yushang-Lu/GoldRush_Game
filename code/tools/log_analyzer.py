@@ -72,6 +72,7 @@ def summarize(match: MatchLog) -> None:
         f"overlaps={overlaps}"
     )
     final_state = turns[-1]["end"] if turns else {"players": []}
+    net_scores: dict[int, int] = {}
     for player_id in (1, 2):
         costs: list[int] = []
         pickup = 0
@@ -105,6 +106,7 @@ def summarize(match: MatchLog) -> None:
         final = player(final_state, player_id)
         gold = final.get("gold", 0)
         spent = final.get("vision_spent", 0)
+        net_scores[player_id] = gold - spent
         print(
             f"  p{player_id}: gross={gold} vision={spent} net={gold - spent} "
             f"recorded_pickup={pickup} first={first}/{len(turns)} "
@@ -120,6 +122,12 @@ def summarize(match: MatchLog) -> None:
             f"p99={percentile(costs, 0.99):.3f} "
             f"max={(max(costs) / 1000.0 if costs else 0.0):.3f}"
         )
+    if len(net_scores) == 2:
+        winner = "draw" if net_scores[1] == net_scores[2] else (
+            "p1" if net_scores[1] > net_scores[2] else "p2"
+        )
+        margin = net_scores[1] - net_scores[2]
+        print(f"  result: winner={winner} p1_net_margin={margin:+d}")
 
 
 def main(argv: list[str]) -> int:
@@ -138,6 +146,23 @@ def main(argv: list[str]) -> int:
         maps_equal = all(match.board == matches[0].board for match in matches[1:])
         opponents_equal = all(match.players == matches[0].players for match in matches[1:])
         print(f"cross_match: same_map={maps_equal} same_players={opponents_equal}")
+        p1_wins = p2_wins = draws = 0
+        for match in matches:
+            final = match.turns[-1]["end"]
+            scores = []
+            for player_id in (1, 2):
+                value = player(final, player_id)
+                scores.append(value.get("gold", 0) - value.get("vision_spent", 0))
+            if scores[0] > scores[1]:
+                p1_wins += 1
+            elif scores[0] < scores[1]:
+                p2_wins += 1
+            else:
+                draws += 1
+        print(
+            f"cross_match_result: p1_wins={p1_wins} p2_wins={p2_wins} "
+            f"draws={draws}"
+        )
     return 0
 
 

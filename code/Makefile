@@ -15,6 +15,7 @@ LOG_ANALYZER := tools/log_analyzer.py
 REPLAY_COMPARE := tools/replay_compare.py
 LOGS ?= ../logs/*.log
 BASELINE_SO ?= tests/player_baseline.so
+PERF_RATIO ?= 0.05
 
 all: $(TARGET)
 
@@ -52,7 +53,13 @@ replay: $(TARGET)
 	test -f $(BASELINE_SO)
 	python3 -B $(REPLAY_COMPARE) $(BASELINE_SO) $(TARGET) $(LOGS)
 
+compare: $(TARGET) $(BENCH_BIN)
+	test -f $(BASELINE_SO)
+	python3 -B $(REPLAY_COMPARE) $(BASELINE_SO) $(TARGET) $(LOGS)
+	./$(BENCH_BIN) 100000 3 $(BASELINE_SO) $(PERF_RATIO)
+
 clean:
 	rm -f $(TARGET) $(TEST_BIN) $(SANITIZER_BIN) $(BENCH_BIN)
+	rm -rf tools/__pycache__
 
-.PHONY: all test sanitize bench logs replay clean
+.PHONY: all test sanitize bench logs replay compare clean
