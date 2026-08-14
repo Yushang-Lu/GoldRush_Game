@@ -32,6 +32,7 @@ constexpr unsigned char kGoldPreemptedMask =
 #endif
 constexpr uint64_t kReachLaneEven = 0x5555555555555555ULL;
 constexpr uint64_t kReachLaneOdd = 0xAAAAAAAAAAAAAAAAULL;
+constexpr int kExtendedSearchEvidence = 3;
 
 struct LocalOffset {
     signed char dr;
@@ -64,12 +65,17 @@ inline bool inside(int row, int col) noexcept {
 inline int cellOf(int row, int col) noexcept { return row * kRows + col; }
 
 inline int remainingGold(int gold) noexcept {
-    return gold > 0 ? static_cast<int>((7LL * gold) / 20) : 0;
+    return gold > 0
+               ? static_cast<int>((7ULL * static_cast<unsigned>(gold)) / 20U)
+               : 0;
 }
 
 inline int pickupGold(int gold) noexcept {
     // 对正金币直接计算 ceil(13g/20)；非正值保持原先 gold-0 的语义。
-    return gold > 0 ? static_cast<int>((13LL * gold + 19) / 20) : gold;
+    return gold > 0
+               ? static_cast<int>(
+                     (13ULL * static_cast<unsigned>(gold) + 19U) / 20U)
+               : gold;
 }
 
 inline int saturatingGainAdd(int current, int gain) noexcept {
@@ -116,10 +122,16 @@ static_assert(sizeof(Route) == 12, "极速路径应保持双寄存器返回布�
 
 struct SpeedBelief {
     int round = -1;
+    short expectedCells[2]{-1, -1};
     long long held = 0;
     long long expectedGain = 0;
-    int slowEvidence = 0;
+    unsigned char slowEvidence = 0;
+    unsigned char searchEvidence = 0;
+    bool strongWitness = false;
 };
+
+static_assert(sizeof(SpeedBelief) == 32,
+              "后手信念必须保持原有TLS布局大小");
 
 struct EnemyPositionMemory {
     int round = -2;
@@ -133,7 +145,9 @@ struct FailureGuard {
 
 struct ThreadState {
     SpeedBelief speed;
+#if !defined(GOLD_ABLATE_FAILURE_GUARD)
     EnemyPositionMemory enemies;
+#endif
 };
 
 thread_local ThreadState threadState;
@@ -456,13 +470,11 @@ void scanLocalGold(const GameInput& input, int unit,
         int prefix3 = take1;
         if (distance != 4) {
             const int remaining2 = remainingGold(remaining1);
-            const int take2 = remaining1 - remaining2;
-            prefix2 = take1 + take2;
+            prefix2 = estimatedGold - remaining2;
             prefix3 = prefix2;
             if (distance == 1) {
                 const int remaining3 = remainingGold(remaining2);
-                const int take3 = remaining2 - remaining3;
-                prefix3 = prefix2 + take3;
+                prefix3 = estimatedGold - remaining3;
             }
         }
         switch (distance) {
@@ -526,7 +538,7 @@ Target selectGoldWaypoint(const Position start, const LocalGoldScan& scan,
     int bestDistance = 0;
     int approachTake = 0;
     for (int index = 0; index < scan.count; ++index) {
-        const LocalCandidate candidate = scan.candidates[index];
+        const LocalCandidate& candidate = scan.candidates[index];
         const int cell = candidate.cell;
         if (cell == forbiddenCell) continue;
         const int distance = candidate.distance;
@@ -637,8 +649,11 @@ inline void replaceFailureGuard(int action, int nominalRow, int nominalCol,
                                 const int ground[kCells],
                                 const EnemyPositionMemory& memory,
                                 FailureGuard& guard) noexcept {
+    // 原地等待不会消除上一条可失败移动带来的位置分歧：若那一步被
+    // 快方挡住，等待后角色仍在旧起点，下一条移动仍须按旧起点验雷。
+    if (action == kStay) return;
     guard.active = false;
-    if (!enabled || action == kStay) return;
+    if (!enabled) return;
     const int nextRow = nominalRow + kDr[action];
     const int nextCol = nominalCol + kDc[action];
     if (!inside(nextRow, nextCol)) return;
@@ -914,6 +929,325 @@ GameOutput safeOutput() noexcept {
     return GameOutput{{kStay, kStay, kStay, kStay, kStay, kStay}, 3, 0, 0};
 }
 
+struct JointSearchResult {
+    GameOutput output = safeOutput();
+    long long expectedGain = -1;
+    long long terminalValue = LLONG_MIN;
+};
+
+struct JointSearchContext {
+    const GameInput& input;
+    const uint64_t* reachRows;
+    const unsigned char* npcCounts;
+    const unsigned char* legalLow;
+    const unsigned char* legalHigh;
+    const EnemyPositionMemory& enemyMemory;
+    Target macros[2];
+    int ground[kCells];
+    int positions[2];
+    long long held[2]{};
+    FailureGuard guards[2]{};
+    int actions[6]{kStay, kStay, kStay, kStay, kStay, kStay};
+    int executionUnits[6]{};
+    int executionSlots[6]{};
+    int allocation = 3;
+    int order = 0;
+    int preferredAllocation = 3;
+    JointSearchResult best;
+
+    JointSearchContext(const GameInput& currentInput,
+                       const uint64_t currentReachRows[17],
+                       const unsigned char currentNpcCounts[kCells],
+                       const unsigned char currentLegalLow[kCells],
+                       const unsigned char currentLegalHigh[kCells],
+                       const EnemyPositionMemory& currentEnemyMemory,
+                       const Target& macro0, const Target& macro1) noexcept
+        : input(currentInput),
+          reachRows(currentReachRows),
+          npcCounts(currentNpcCounts),
+          legalLow(currentLegalLow),
+          legalHigh(currentLegalHigh),
+          enemyMemory(currentEnemyMemory),
+          macros{macro0, macro1} {}
+};
+
+long long jointTerminalValue(const JointSearchContext& search) noexcept {
+    long long value = 0;
+    for (int unit = 0; unit < 2; ++unit) {
+        const int cell = search.positions[unit];
+        const int row = cell / kRows;
+        const int col = cell - row * kRows;
+        const unsigned char* const legal = search.held[unit] < 200
+                                               ? search.legalLow
+                                               : search.legalHigh;
+        int nextTake = 0;
+        [[maybe_unused]] const bool protectNpcReach =
+#if defined(GOLD_ABLATE_NPC_REACH)
+            false;
+#else
+            search.held[unit] >= 600;
+#endif
+        for (int action = 0; action < 4; ++action) {
+            const int nextRow = row + kDr[action];
+            const int nextCol = col + kDc[action];
+            if (!inside(nextRow, nextCol)) continue;
+            const int nextCell = cellOf(nextRow, nextCol);
+            if (legal[nextCell] == 0U ||
+                nextCell == search.positions[1 - unit]) {
+                continue;
+            }
+#if !defined(GOLD_ABLATE_NPC_REACH)
+            if (entersNpcReachCrowd(row, col, action, protectNpcReach,
+                                    search.reachRows)) {
+                continue;
+            }
+#endif
+#if !defined(GOLD_ABLATE_ENEMY_PREDICTOR)
+            if (search.ground[nextCell] <= 0 &&
+                (search.npcCounts[nextCell] & kPredictedEnemyFlag) != 0U) {
+                continue;
+            }
+#endif
+            const int take = pickupGold(effectiveGold(
+                search.ground[nextCell], search.npcCounts[nextCell]));
+            if (take > nextTake) nextTake = take;
+        }
+        value += static_cast<long long>(nextTake) * 64;
+        value -= absInt(search.macros[unit].row - row) +
+                 absInt(search.macros[unit].col - col);
+    }
+    return value;
+}
+
+bool betterJointPlan(const JointSearchContext& search, long long gain,
+                     long long terminalValue) noexcept {
+    if (gain != search.best.expectedGain) {
+        return gain > search.best.expectedGain;
+    }
+    if (terminalValue != search.best.terminalValue) {
+        return terminalValue > search.best.terminalValue;
+    }
+    const int distance = absInt(search.allocation - search.preferredAllocation);
+    const int bestDistance =
+        absInt(search.best.output.k - search.preferredAllocation);
+    if (distance != bestDistance) return distance < bestDistance;
+    if (search.order != search.best.output.order) {
+        return search.order < search.best.output.order;
+    }
+    for (int slot = 0; slot < 6; ++slot) {
+        if (search.actions[slot] != search.best.output.actions[slot]) {
+            return search.actions[slot] < search.best.output.actions[slot];
+        }
+    }
+    return false;
+}
+
+void searchJointActions(JointSearchContext& search, int depth,
+                        long long gain) noexcept {
+    if (depth == 6) {
+        if (gain < search.best.expectedGain) return;
+        const long long terminalValue = jointTerminalValue(search);
+        if (!betterJointPlan(search, gain, terminalValue)) return;
+        for (int slot = 0; slot < 6; ++slot) {
+            search.best.output.actions[slot] = search.actions[slot];
+        }
+        search.best.output.k = search.allocation;
+        search.best.output.order = search.order;
+        search.best.output.vp = 0;
+        search.best.expectedGain = gain;
+        search.best.terminalValue = terminalValue;
+        return;
+    }
+
+    const int unit = search.executionUnits[depth];
+    const int slot = search.executionSlots[depth];
+    const int cell = search.positions[unit];
+    const int row = cell / kRows;
+    const int col = cell - row * kRows;
+    const long long held = search.held[unit];
+    const unsigned char* const legal =
+        held < 200 ? search.legalLow : search.legalHigh;
+    const bool guardEnabled =
+#if defined(GOLD_ABLATE_FAILURE_GUARD)
+        false;
+#else
+        held >= 250;
+#endif
+    [[maybe_unused]] const bool protectNpcReach =
+#if defined(GOLD_ABLATE_NPC_REACH)
+        false;
+#else
+        held >= 600;
+#endif
+
+    for (int action = 0; action <= kStay; ++action) {
+        const FailureGuard oldGuard = search.guards[unit];
+        search.actions[slot] = action;
+        if (action == kStay) {
+            searchJointActions(search, depth + 1, gain);
+            search.guards[unit] = oldGuard;
+            continue;
+        }
+
+        const int nextRow = row + kDr[action];
+        const int nextCol = col + kDc[action];
+        if (!legalStep(nextRow, nextCol, search.positions[1 - unit], -1,
+                       legal)) {
+            continue;
+        }
+#if !defined(GOLD_ABLATE_NPC_REACH)
+        if (entersNpcReachCrowd(row, col, action, protectNpcReach,
+                               search.reachRows)) {
+            continue;
+        }
+#endif
+        if (!safeForFailureGuard(action, search.guards[unit],
+                                 search.ground)) {
+            continue;
+        }
+
+        const int nextCell = cellOf(nextRow, nextCol);
+#if !defined(GOLD_ABLATE_ENEMY_PREDICTOR)
+        if (search.ground[nextCell] <= 0 &&
+            (search.npcCounts[nextCell] & kPredictedEnemyFlag) != 0U) {
+            continue;
+        }
+#endif
+        const int oldGround = search.ground[nextCell];
+        replaceFailureGuard(action, row, col, guardEnabled, search.input,
+                            search.npcCounts, search.ground,
+                            search.enemyMemory, search.guards[unit]);
+        search.positions[unit] = nextCell;
+        int movedRow = row;
+        int movedCol = col;
+        const int take = applyStep(action, movedRow, movedCol,
+                                   search.npcCounts, search.ground);
+        search.held[unit] += take;
+        searchJointActions(search, depth + 1, gain + take);
+        search.held[unit] -= take;
+        search.ground[nextCell] = oldGround;
+        search.positions[unit] = cell;
+        search.guards[unit] = oldGuard;
+    }
+}
+
+JointSearchResult findBestJointPlan(
+    const GameInput& input, const Target& macro0, const Target& macro1,
+    const uint64_t reachRows[17], const unsigned char npcCounts[kCells],
+    const unsigned char legalLow[kCells],
+    const unsigned char legalHigh[kCells], int preferredAllocation,
+    long long incumbentGain,
+    const EnemyPositionMemory& enemyMemory) noexcept {
+    JointSearchContext search(input, reachRows, npcCounts, legalLow,
+                              legalHigh, enemyMemory, macro0, macro1);
+    search.preferredAllocation = preferredAllocation;
+    search.best.expectedGain = incumbentGain;
+
+    // 固定上限为 10 种己方执行日程 × 5^6 个动作串；无需读取时钟，
+    // 因而相同输入不会因调度抖动停在不同候选上。
+    for (int allocation = 1; allocation <= 5; ++allocation) {
+        for (int order = 0; order <= 1; ++order) {
+            search.allocation = allocation;
+            search.order = order;
+            search.positions[0] =
+                cellOf(input.my_units[0].row, input.my_units[0].col);
+            search.positions[1] =
+                cellOf(input.my_units[1].row, input.my_units[1].col);
+            search.held[0] = input.my_units_gold[0];
+            search.held[1] = input.my_units_gold[1];
+            search.guards[0] = FailureGuard{};
+            search.guards[1] = FailureGuard{};
+            std::memcpy(search.ground, input.grid, sizeof(search.ground));
+            for (int slot = 0; slot < 6; ++slot) {
+                search.actions[slot] = kStay;
+            }
+
+            int depth = 0;
+            if (order == 0) {
+                for (int slot = 0; slot < allocation; ++slot) {
+                    search.executionUnits[depth] = 0;
+                    search.executionSlots[depth++] = slot;
+                }
+                for (int slot = allocation; slot < 6; ++slot) {
+                    search.executionUnits[depth] = 1;
+                    search.executionSlots[depth++] = slot;
+                }
+            } else {
+                for (int slot = allocation; slot < 6; ++slot) {
+                    search.executionUnits[depth] = 1;
+                    search.executionSlots[depth++] = slot;
+                }
+                for (int slot = 0; slot < allocation; ++slot) {
+                    search.executionUnits[depth] = 0;
+                    search.executionSlots[depth++] = slot;
+                }
+            }
+            searchJointActions(search, 0, 0);
+        }
+    }
+    return search.best;
+}
+
+struct SpeedWitness {
+    short cells[2]{-1, -1};
+    bool strong = true;
+};
+
+SpeedWitness makeSpeedWitness(
+    const GameInput& input, const GameOutput& output,
+    const unsigned char npcCounts[kCells]) noexcept {
+    SpeedWitness witness;
+    int positions[2] = {
+        cellOf(input.my_units[0].row, input.my_units[0].col),
+        cellOf(input.my_units[1].row, input.my_units[1].col),
+    };
+    const int enemyCells[2] = {
+        inside(input.visible_enemies[0].row, input.visible_enemies[0].col)
+            ? cellOf(input.visible_enemies[0].row,
+                     input.visible_enemies[0].col)
+            : -1,
+        inside(input.visible_enemies[1].row, input.visible_enemies[1].col)
+            ? cellOf(input.visible_enemies[1].row,
+                     input.visible_enemies[1].col)
+            : -1,
+    };
+
+    for (int phase = 0; phase < 2; ++phase) {
+        const int unit = phase == 0 ? output.order : 1 - output.order;
+        const int begin = unit == 0 ? 0 : output.k;
+        const int end = unit == 0 ? output.k : 6;
+        for (int slot = begin; slot < end; ++slot) {
+            const int action = output.actions[slot];
+            if (action == kStay) continue;
+            const int cell = positions[unit];
+            const int row = cell / kRows;
+            const int col = cell - row * kRows;
+            const int nextRow = row + kDr[action];
+            const int nextCol = col + kDc[action];
+            if (!inside(nextRow, nextCol)) {
+                witness.strong = false;
+                continue;
+            }
+            const int nextCell = cellOf(nextRow, nextCol);
+            const int tile = input.grid[nextRow][nextCol];
+            if (tile == -1 || tile == -3 ||
+                nextCell == positions[1 - unit]) {
+                witness.strong = false;
+                continue;
+            }
+            if (tile == -5 || nextCell == enemyCells[0] ||
+                nextCell == enemyCells[1] ||
+                (npcCounts[nextCell] & kNpcCountMask) >= 3U) {
+                witness.strong = false;
+            }
+            positions[unit] = nextCell;
+        }
+    }
+    witness.cells[0] = static_cast<short>(positions[0]);
+    witness.cells[1] = static_cast<short>(positions[1]);
+    return witness;
+}
+
 bool likelySlowHand(SpeedBelief& belief, const GameInput& input) noexcept {
     const long long held =
         static_cast<long long>(input.my_units_gold[0]) +
@@ -926,11 +1260,13 @@ bool likelySlowHand(SpeedBelief& belief, const GameInput& input) noexcept {
         return false;
     }
 
+    const long long actualGain = held - belief.held;
+    const bool gainGap = belief.expectedGain >= 2 && actualGain >= 0 &&
+                         actualGain < belief.expectedGain;
     if (belief.expectedGain >= 2) {
-        const long long actualGain = held - belief.held;
         // 风险扣款会令持币变化为负，不能把它误判成“资源被快手抢先”。
         // 只累计非负但低于可见路径预期的独立缺口，连续两次才启用折价。
-        if (actualGain >= 0 && actualGain < belief.expectedGain) {
+        if (gainGap) {
             ++belief.slowEvidence;
             if (belief.slowEvidence > 8) belief.slowEvidence = 8;
         } else if (actualGain >= belief.expectedGain &&
@@ -938,15 +1274,36 @@ bool likelySlowHand(SpeedBelief& belief, const GameInput& input) noexcept {
             --belief.slowEvidence;
         }
     }
+
+    bool positionGap = false;
+    if (belief.strongWitness) {
+        for (int unit = 0; unit < 2; ++unit) {
+            const int actualCell =
+                cellOf(input.my_units[unit].row, input.my_units[unit].col);
+            positionGap = positionGap || actualCell != belief.expectedCells[unit];
+        }
+        if (gainGap || positionGap) {
+            ++belief.searchEvidence;
+            if (belief.searchEvidence > 8) belief.searchEvidence = 8;
+        } else if (actualGain >= belief.expectedGain &&
+                   belief.searchEvidence > 0 &&
+                   belief.searchEvidence < kExtendedSearchEvidence) {
+            --belief.searchEvidence;
+        }
+    }
     return belief.slowEvidence >= 2;
 }
 
 void rememberExpectedGain(SpeedBelief& belief, const GameInput& input,
-                          long long expectedGain) noexcept {
+                          long long expectedGain,
+                          const SpeedWitness& witness) noexcept {
     belief.round = input.round;
     belief.held = static_cast<long long>(input.my_units_gold[0]) +
                   input.my_units_gold[1];
     belief.expectedGain = expectedGain;
+    belief.expectedCells[0] = witness.cells[0];
+    belief.expectedCells[1] = witness.cells[1];
+    belief.strongWitness = witness.strong;
 }
 
 GameOutput decide(const GameInput& input) noexcept {
@@ -958,6 +1315,9 @@ GameOutput decide(const GameInput& input) noexcept {
     ThreadState& state = threadState;
 #if !defined(GOLD_ABLATE_FAILURE_GUARD)
     rememberEnemyPositions(state.enemies, input);
+    const EnemyPositionMemory& enemyMemory = state.enemies;
+#else
+    static constexpr EnemyPositionMemory enemyMemory{};
 #endif
     int ground[kCells];
     std::memcpy(ground, input.grid, sizeof(ground));
@@ -1043,7 +1403,7 @@ GameOutput decide(const GameInput& input) noexcept {
     Target target0 = gold0.gold > 0 ? gold0 : macro0;
     Route route0 = makeRoute(
         input, 0, target0, macro0, start1, -1, reachRows, npcCounts, ground,
-        legalLow, legalHigh, allocation, robust, emergency0, state.enemies);
+        legalLow, legalHigh, allocation, robust, emergency0, enemyMemory);
 
     // 固定角色0先执行时，若它最终停在双方共同目标上，尝试多给一步。
     // 只有实际重放确认新路线腾出了角色1目标才接受，避免用距离奇偶猜测。
@@ -1066,7 +1426,7 @@ GameOutput decide(const GameInput& input) noexcept {
         route0 = makeRoute(
             input, 0, target0, macro0, start1, -1, reachRows, npcCounts,
             ground, legalLow, legalHigh, allocation, robust, emergency0,
-            state.enemies);
+            enemyMemory);
         watchedCell =
             gold1.gold > 0 ? cellOf(gold1.row, gold1.col) : -1;
         if (watchedCell >= 0 && route0.endCell == watchedCell) {
@@ -1079,7 +1439,7 @@ GameOutput decide(const GameInput& input) noexcept {
             route0 = makeRoute(
                 input, 0, target0, macro0, start1, -1, reachRows, npcCounts,
                 ground, legalLow, legalHigh, allocation, robust, emergency0,
-                state.enemies);
+                enemyMemory);
             watchedCell =
                 gold1.gold > 0 ? cellOf(gold1.row, gold1.col) : -1;
         }
@@ -1097,7 +1457,7 @@ GameOutput decide(const GameInput& input) noexcept {
     const Route route1 = makeRoute(
         input, 1, target1, macro1, route0.endCell, -1, reachRows, npcCounts,
         ground, legalLow, legalHigh, actions1, robust, emergency1,
-        state.enemies);
+        enemyMemory);
 
     GameOutput output;
     output.k = allocation;
@@ -1109,9 +1469,22 @@ GameOutput decide(const GameInput& input) noexcept {
     for (int step = 0; step < actions1; ++step) {
         output.actions[step + allocation] = route1.actions[step];
     }
-    rememberExpectedGain(state.speed, input,
-                         static_cast<long long>(route0.expectedGain) +
-                             route1.expectedGain);
+    long long expectedGain = static_cast<long long>(route0.expectedGain) +
+                             route1.expectedGain;
+    if (state.speed.searchEvidence >= kExtendedSearchEvidence &&
+        !emergency0 && !emergency1) {
+        const JointSearchResult searched = findBestJointPlan(
+            input, macro0, macro1, reachRows, npcCounts, legalLow, legalHigh,
+            allocation, expectedGain, enemyMemory);
+        // 极速方案始终是保底；联合枚举只为更高的本轮可兑现收益改变行为，
+        // 同收益的终点偏好不值得承担额外策略漂移。
+        if (searched.expectedGain > expectedGain) {
+            output = searched.output;
+            expectedGain = searched.expectedGain;
+        }
+    }
+    const SpeedWitness witness = makeSpeedWitness(input, output, npcCounts);
+    rememberExpectedGain(state.speed, input, expectedGain, witness);
     return output;
 }
 
