@@ -104,6 +104,8 @@ void validateKnownPath(const GameInput& input, const GameOutput& output) {
                     input.round);
             require(input.grid[next.row][next.col] != -1,
                     "strategy emitted known wall collision", input.round);
+            require(input.grid[next.row][next.col] != -3,
+                    "strategy entered a known bomb", input.round);
             require(next.row != positions[1 - unit].row ||
                         next.col != positions[1 - unit].col,
                     "strategy emitted self collision", input.round);
@@ -391,6 +393,51 @@ void testDynamicAllocationAndRepeatedPickup() {
             "strategy did not re-enter a rich tile for repeated pickup");
 }
 
+void testFullBudgetForGoldUnderfoot() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{15, 15};
+    reveal(input, input.my_units[0], 2);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][8] = 100;
+    const GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(output.k == S,
+            "strategy did not use all six steps for an extra rich-tile entry");
+    require(pickupOnKnownPath(input, output) >= 95,
+            "six-step allocation missed the third underfoot-gold entry");
+}
+
+void testSlowHandDiscountAndReset() {
+    GameInput input = baseInput(0);
+    input.my_units[0] = Position{8, 8};
+    input.my_units[1] = Position{15, 15};
+    reveal(input, input.my_units[0], 2);
+    reveal(input, input.my_units[1], 2);
+    input.grid[8][9] = 100;
+    (void)moveDecision(&input);
+
+    input.round = 1;
+    (void)moveDecision(&input);
+
+    input.round = 2;
+    input.grid[9][8] = 40;
+    input.visible_enemies[0] = Position{8, 10};
+    GameOutput output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(output.actions[0] == 1,
+            "slow-hand model did not prefer uncontested realized value");
+
+    input.round = 0;
+    output = moveDecision(&input);
+    validateOutput(output, input.round);
+    validateKnownPath(input, output);
+    require(output.actions[0] == 3,
+            "new-game reset retained stale slow-hand evidence");
+}
+
 void testProfitableUnitMovesFirst() {
     GameInput input = baseInput(0);
     input.my_units[0] = Position{8, 8};
@@ -618,6 +665,8 @@ int main(int argc, char** argv) {
     testAllFogAndCorners();
     testAdjacentGold();
     testDynamicAllocationAndRepeatedPickup();
+    testFullBudgetForGoldUnderfoot();
+    testSlowHandDiscountAndReset();
     testProfitableUnitMovesFirst();
     testCrowdedGoldAvoidance();
     testSnapshotOuterRedirectAndExpiry();

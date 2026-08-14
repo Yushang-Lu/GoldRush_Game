@@ -4,7 +4,8 @@ CPPFLAGS := -I../game
 WARNINGS := -Wall -Wextra -Wpedantic -Wconversion -Wshadow
 COMMON_FLAGS := -std=c++17 $(WARNINGS)
 RELEASE_FLAGS := -O3 -DNDEBUG -fPIC -flto -fno-exceptions -fno-rtti \
-	-fvisibility=hidden -fno-semantic-interposition
+	-fvisibility=hidden -fno-semantic-interposition -fno-stack-protector \
+	-march=x86-64-v3
 SANITIZER_FLAGS := -O1 -g -fno-omit-frame-pointer \
 	-fsanitize=address,undefined
 
@@ -19,12 +20,13 @@ REPLAY_COMPARE := tools/replay_compare.py
 LOGS ?= ../logs/*.log
 BASELINE_SO ?= tests/player_baseline.so
 PERF_RATIO ?= 0.05
-OPPONENT_SO ?= tests/info_player.so
-OPPONENT_SRC ?= ../info/player.cpp
+VERSUS_RATIO ?= 0.95
+OPPONENT_SO ?= tests/info_player2.so
+OPPONENT_SRC ?= ../info/player2.cpp
 
 all: $(TARGET)
 
-$(TARGET): player.cpp ../game/game_api.h
+$(TARGET): player.cpp ../game/game_api.h Makefile
 	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(RELEASE_FLAGS) \
 		-shared -Wl,-z,defs -Wl,--as-needed -o $@ player.cpp
 
@@ -40,7 +42,7 @@ $(BENCH_BIN): tests/bench.cpp ../game/game_api.h
 	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) -O3 -DNDEBUG \
 		-o $@ tests/bench.cpp -ldl
 
-$(OPPONENT_SO): $(OPPONENT_SRC) ../game/game_api.h
+$(OPPONENT_SO): $(OPPONENT_SRC) ../game/game_api.h Makefile
 	$(CXX) $(CPPFLAGS) $(COMMON_FLAGS) $(RELEASE_FLAGS) \
 		-shared -Wl,-z,defs -Wl,--as-needed -o $@ $(OPPONENT_SRC)
 
@@ -57,7 +59,7 @@ bench: $(TARGET) $(BENCH_BIN)
 
 versus: $(TARGET) $(BENCH_BIN) $(OPPONENT_SO)
 	python3 -B $(REPLAY_COMPARE) $(OPPONENT_SO) $(TARGET) $(LOGS)
-	./$(BENCH_BIN) 100000 5 $(OPPONENT_SO) 1.0
+	./$(BENCH_BIN) 100000 5 $(OPPONENT_SO) $(VERSUS_RATIO)
 
 logs:
 	python3 -B $(LOG_ANALYZER) $(LOGS)
@@ -73,7 +75,7 @@ compare: $(TARGET) $(BENCH_BIN)
 
 clean:
 	rm -f $(TARGET) $(TEST_BIN) $(SANITIZER_BIN) $(BENCH_BIN) \
-		tests/info_player.so
+		tests/info_player2.so
 	rm -rf tools/__pycache__
 
 .PHONY: all test sanitize bench versus logs replay compare clean

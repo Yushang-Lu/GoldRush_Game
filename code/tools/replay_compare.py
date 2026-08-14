@@ -199,10 +199,68 @@ def evaluate(
     )
 
 
+def late_hand_input(game: GameInput) -> GameInput:
+    """Apply the one-pickup contest model used after slow-hand evidence.
+
+    This is deliberately only a visible-information heuristic.  It discounts
+    each positive tile at or next to a visible enemy/NPC once; it does not
+    claim to reconstruct hidden movement.
+    """
+    result = GameInput()
+    ctypes.memmove(ctypes.byref(result), ctypes.byref(game), ctypes.sizeof(game))
+    marked: set[tuple[int, int]] = set()
+    own = {(game.my_units[i].row, game.my_units[i].col) for i in range(2)}
+    offsets = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+    for enemy in game.visible_enemies:
+        if not (0 <= enemy.row < GRID_SIZE and 0 <= enemy.col < GRID_SIZE):
+            continue
+        for dr, dc in offsets:
+            cell = (enemy.row + dr, enemy.col + dc)
+            if 0 <= cell[0] < GRID_SIZE and 0 <= cell[1] < GRID_SIZE:
+                marked.add(cell)
+    marked.difference_update(own)
+    limit = max(0, min(MAX_NPCS, game.num_visible_npcs))
+    for index in range(limit):
+        npc = game.visible_npcs[index]
+        if npc.id == 0 or not (
+            0 <= npc.pos.row < GRID_SIZE and 0 <= npc.pos.col < GRID_SIZE
+        ):
+            continue
+        for dr, dc in offsets:
+            cell = (npc.pos.row + dr, npc.pos.col + dc)
+            if 0 <= cell[0] < GRID_SIZE and 0 <= cell[1] < GRID_SIZE:
+                marked.add(cell)
+    for row, col in marked:
+        value = result.grid[row][col]
+        if value > 0:
+            result.grid[row][col] = value * 7 // 20
+    return result
+
+
+def logged_output(turn: dict[str, Any]) -> GameOutput | None:
+    own = player(turn["end"], 1)
+    first = own["units"][0].get("actions", [])
+    second = own["units"][1].get("actions", [])
+    actions = first + second
+    if len(actions) != STEPS:
+        return None
+    result = GameOutput()
+    for index, action in enumerate(actions):
+        result.actions[index] = action
+    result.k = len(first)
+    result.order = own.get("order", 0)
+    result.vp = 0
+    return result
+
+
 def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
     changed = 0
     totals = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
     immediate = [0, 0, 0]  # candidate worse/equal/better
+    late_values = [0, 0]
+    late_immediate = [0, 0, 0]
+    calibration = [0, 0, 0, 0]  # raw, modeled, actual, sample count
+    calibration_error = [0, 0]
     vp_changes = 0
     bomb_seen: dict[tuple[int, int], int] = {}
     for turn in match.turns:
@@ -234,6 +292,39 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
         evaluations = [
             evaluate(game, output, remembered_bombs) for output in outputs
         ]
+        dispatch = turn["end"].get("dispatch_order", [])
+        is_late = (
+            1 in dispatch and 2 in dispatch and dispatch.index(1) > dispatch.index(2)
+        )
+        scoring_game = late_hand_input(game) if is_late else game
+        late_evaluations = [
+            evaluate(scoring_game, output, remembered_bombs) for output in outputs
+        ]
+        late_round_values = []
+        for index, value in enumerate(late_evaluations):
+            net = value.pickup - value.known_loss - value.remembered_bomb_loss
+            late_values[index] += net
+            late_round_values.append(net)
+        late_immediate[
+            (late_round_values[1] > late_round_values[0])
+            - (late_round_values[1] < late_round_values[0])
+            + 1
+        ] += 1
+        if is_late:
+            recorded = logged_output(turn)
+            if recorded is not None:
+                raw = evaluate(game, recorded).pickup
+                modeled = evaluate(scoring_game, recorded).pickup
+                actual = sum(
+                    unit.get("pickup", 0)
+                    for unit in player(turn["end"], 1)["units"]
+                )
+                calibration[0] += raw
+                calibration[1] += modeled
+                calibration[2] += actual
+                calibration[3] += 1
+                calibration_error[0] += abs(raw - actual)
+                calibration_error[1] += abs(modeled - actual)
         for index, value in enumerate(evaluations):
             totals[index][0] += value.pickup
             totals[index][1] += value.known_loss
@@ -264,7 +355,20 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
         f"  immediate_value: worse={immediate[0]} equal={immediate[1]} "
         f"better={immediate[2]}"
     )
-    return totals, immediate
+    print(
+        f"  late_hand_model: baseline={late_values[0]} "
+        f"candidate={late_values[1]} delta={late_values[1] - late_values[0]:+d} "
+        f"worse={late_immediate[0]} equal={late_immediate[1]} "
+        f"better={late_immediate[2]}"
+    )
+    print(
+        f"  model_calibration: late_rounds={calibration[3]} "
+        f"actual_pickup={calibration[2]} raw_prediction={calibration[0]} "
+        f"modeled_prediction={calibration[1]} "
+        f"raw_abs_error={calibration_error[0]} "
+        f"modeled_abs_error={calibration_error[1]}"
+    )
+    return totals, immediate, late_values, late_immediate
 
 
 def main(argv: list[str]) -> int:
@@ -278,8 +382,10 @@ def main(argv: list[str]) -> int:
         candidate = Strategy(args.candidate)
         aggregate = [[0] * 6, [0] * 6]
         immediate = [0, 0, 0]
+        late_values = [0, 0]
+        late_immediate = [0, 0, 0]
         for path in args.logs:
-            totals, match_immediate = compare(
+            totals, match_immediate, match_late, match_late_immediate = compare(
                 read_log(path), baseline, candidate
             )
             for strategy in range(2):
@@ -287,6 +393,9 @@ def main(argv: list[str]) -> int:
                     aggregate[strategy][metric] += totals[strategy][metric]
             for index in range(3):
                 immediate[index] += match_immediate[index]
+                late_immediate[index] += match_late_immediate[index]
+            for strategy in range(2):
+                late_values[strategy] += match_late[strategy]
         if len(args.logs) > 1:
             print("aggregate:")
             for label, values in zip(("baseline", "candidate"), aggregate):
@@ -300,6 +409,13 @@ def main(argv: list[str]) -> int:
             print(
                 f"  immediate_value: worse={immediate[0]} "
                 f"equal={immediate[1]} better={immediate[2]}"
+            )
+            print(
+                f"  late_hand_model: baseline={late_values[0]} "
+                f"candidate={late_values[1]} "
+                f"delta={late_values[1] - late_values[0]:+d} "
+                f"worse={late_immediate[0]} equal={late_immediate[1]} "
+                f"better={late_immediate[2]}"
             )
     except (OSError, ValueError) as error:
         parser.error(str(error))
