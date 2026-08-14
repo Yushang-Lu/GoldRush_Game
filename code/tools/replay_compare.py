@@ -93,10 +93,12 @@ class Strategy:
 class Evaluation:
     pickup: int
     known_loss: int
+    crowded_loss: int
     remembered_bomb_loss: int
     remembered_bomb_entries: int
     fog_moves: int
     blocked: int
+    moves: int
 
 
 def build_input(turn: dict[str, Any]) -> GameInput:
@@ -148,9 +150,17 @@ def evaluate(
     held = [int(game.my_units_gold[i]) for i in range(2)]
     remaining: dict[tuple[int, int], int] = {}
     consumed_bombs: set[tuple[int, int]] = set()
-    pickup = known_loss = remembered_bomb_loss = remembered_bomb_entries = 0
-    fog_moves = blocked = 0
+    pickup = known_loss = crowded_loss = 0
+    remembered_bomb_loss = remembered_bomb_entries = 0
+    fog_moves = blocked = moves = 0
     remembered_bombs = remembered_bombs or set()
+    npc_counts: dict[tuple[int, int], int] = {}
+    npc_limit = max(0, min(MAX_NPCS, game.num_visible_npcs))
+    for index in range(npc_limit):
+        npc = game.visible_npcs[index]
+        cell = (npc.pos.row, npc.pos.col)
+        if npc.id != 0 and 0 <= cell[0] < GRID_SIZE and 0 <= cell[1] < GRID_SIZE:
+            npc_counts[cell] = npc_counts.get(cell, 0) + 1
     for unit in (output.order, 1 - output.order):
         begin, end = (0, output.k) if unit == 0 else (output.k, STEPS)
         for action_index in range(begin, end):
@@ -168,6 +178,7 @@ def evaluate(
                 blocked += 1
                 continue
             positions[unit] = [row, col]
+            moves += 1
             cell = (row, col)
             if value == -5:
                 fog_moves += 1
@@ -189,13 +200,19 @@ def evaluate(
                 held[unit] -= loss
                 known_loss += loss
                 consumed_bombs.add(cell)
+            if npc_counts.get(cell, 0) >= 3:
+                loss = (held[unit] + 19) // 20
+                held[unit] -= loss
+                crowded_loss += loss
     return Evaluation(
         pickup,
         known_loss,
+        crowded_loss,
         remembered_bomb_loss,
         remembered_bomb_entries,
         fog_moves,
         blocked,
+        moves,
     )
 
 
@@ -255,7 +272,7 @@ def logged_output(turn: dict[str, Any]) -> GameOutput | None:
 
 def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
     changed = 0
-    totals = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0]]
+    totals = [[0] * 8, [0] * 8]
     immediate = [0, 0, 0]  # candidate worse/equal/better
     late_values = [0, 0]
     late_immediate = [0, 0, 0]
@@ -302,7 +319,12 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
         ]
         late_round_values = []
         for index, value in enumerate(late_evaluations):
-            net = value.pickup - value.known_loss - value.remembered_bomb_loss
+            net = (
+                value.pickup
+                - value.known_loss
+                - value.crowded_loss
+                - value.remembered_bomb_loss
+            )
             late_values[index] += net
             late_round_values.append(net)
         late_immediate[
@@ -328,18 +350,22 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
         for index, value in enumerate(evaluations):
             totals[index][0] += value.pickup
             totals[index][1] += value.known_loss
-            totals[index][2] += value.remembered_bomb_loss
-            totals[index][3] += value.remembered_bomb_entries
-            totals[index][4] += value.fog_moves
-            totals[index][5] += value.blocked
+            totals[index][2] += value.crowded_loss
+            totals[index][3] += value.remembered_bomb_loss
+            totals[index][4] += value.remembered_bomb_entries
+            totals[index][5] += value.fog_moves
+            totals[index][6] += value.blocked
+            totals[index][7] += value.moves
         value0 = (
             evaluations[0].pickup
             - evaluations[0].known_loss
+            - evaluations[0].crowded_loss
             - evaluations[0].remembered_bomb_loss
         )
         value1 = (
             evaluations[1].pickup
             - evaluations[1].known_loss
+            - evaluations[1].crowded_loss
             - evaluations[1].remembered_bomb_loss
         )
         immediate[(value1 > value0) - (value1 < value0) + 1] += 1
@@ -347,9 +373,9 @@ def compare(match: MatchLog, baseline: Strategy, candidate: Strategy) -> None:
     for label, values in zip(("baseline", "candidate"), totals):
         print(
             f"  {label}: visible_pickup={values[0]} known_loss={values[1]} "
-            f"remembered_bomb_risk={values[2]} "
-            f"remembered_bomb_entries={values[3]} fog_moves={values[4]} "
-            f"blocked={values[5]}"
+            f"crowded_loss={values[2]} remembered_bomb_risk={values[3]} "
+            f"remembered_bomb_entries={values[4]} fog_moves={values[5]} "
+            f"blocked={values[6]} moves={values[7]}"
         )
     print(
         f"  immediate_value: worse={immediate[0]} equal={immediate[1]} "
@@ -380,7 +406,7 @@ def main(argv: list[str]) -> int:
     try:
         baseline = Strategy(args.baseline)
         candidate = Strategy(args.candidate)
-        aggregate = [[0] * 6, [0] * 6]
+        aggregate = [[0] * 8, [0] * 8]
         immediate = [0, 0, 0]
         late_values = [0, 0]
         late_immediate = [0, 0, 0]
@@ -389,7 +415,7 @@ def main(argv: list[str]) -> int:
                 read_log(path), baseline, candidate
             )
             for strategy in range(2):
-                for metric in range(6):
+                for metric in range(8):
                     aggregate[strategy][metric] += totals[strategy][metric]
             for index in range(3):
                 immediate[index] += match_immediate[index]
@@ -402,9 +428,11 @@ def main(argv: list[str]) -> int:
                 print(
                     f"  {label}: visible_pickup={values[0]} "
                     f"known_loss={values[1]} "
-                    f"remembered_bomb_risk={values[2]} "
-                    f"remembered_bomb_entries={values[3]} "
-                    f"fog_moves={values[4]} blocked={values[5]}"
+                    f"crowded_loss={values[2]} "
+                    f"remembered_bomb_risk={values[3]} "
+                    f"remembered_bomb_entries={values[4]} "
+                    f"fog_moves={values[5]} blocked={values[6]} "
+                    f"moves={values[7]}"
                 )
             print(
                 f"  immediate_value: worse={immediate[0]} "
